@@ -1,0 +1,154 @@
+{
+  "project_name": "在线客服系统",
+  "assessment_history": [
+    {
+      "round": 1,
+      "timestamp": "2024-01-15 10:30",
+      "requirement_understanding": [
+        "在线客服系统入口页面",
+        "常见问题自动回答功能",
+        "复杂问题转接人工客服功能",
+        "后台管理系统"
+      ],
+      "function_points": [
+        {
+          "id": "F001",
+          "description": "客服系统入口页面",
+          "effort": {
+            "frontend": 1,
+            "ui_design": 0.5,
+            "ai_engineer": 0,
+            "test": 0.5,
+            "pm": 0.2,
+            "deployment": 0.1
+          }
+        },
+        {
+          "id": "F002",
+          "description": "常见问题自动回答",
+          "effort": {
+            "frontend": 1.5,
+            "ui_design": 0.5,
+            "ai_engineer": 4,
+            "test": 1,
+            "pm": 0.3,
+            "deployment": 0.2
+          }
+        }
+      ],
+      "effort_assessment": {
+        "frontend": 5,
+        "ui_design": 2.5,
+        "ai_engineer": 8,
+        "test": 3,
+        "pm": 1,
+        "deployment": 0.6
+      },
+      "implicit_effort": {
+        "communication": 1,
+        "documentation": 1,
+        "risk_buffer": 2
+      },
+      "clarification_questions": [
+        "常见问题库如何建立和维护？",
+        "转接人工客服的触发条件是什么？",
+        "是否需要集成现有的客服系统？",
+        "系统需要支持哪些语言？"
+      ],
+      "customer_feedback": null,
+      "adjustments": null
+    },
+    {
+      "round": 2,
+      "timestamp": "2024-01-16 14:20",
+      "requirement_understanding": [
+        "在线客服系统入口页面",
+        "基于预设常见问题库的自动回答功能",
+        "用户输入'转人工'时转接人工客服功能",
+        "后台管理系统（仅查看统计）"
+      ],
+      "function_points": [
+        {
+          "id": "F001",
+          "description": "客服系统入口页面",
+          "effort": {
+            "frontend": 1,
+            "ui_design": 0.5,
+            "ai_engineer": 0,
+            "test": 0.5,
+            "pm": 0.2,
+            "deployment": 0.1
+          }
+        },
+        {
+          "id": "F002",
+          "description": "常见问题自动回答",
+          "effort": {
+            "frontend": 1,
+            "ui_design": 0.5,
+            "ai_engineer": 3,
+            "test": 0.8,
+            "pm": 0.2,
+            "deployment": 0.1
+          }
+        }
+      ],
+      "effort_assessment": {
+        "frontend": 4,
+        "ui_design": 2,
+        "ai_engineer": 6,
+        "test": 2.6,
+        "pm": 0.8,
+        "deployment": 0.4
+      },
+      "implicit_effort": {
+        "communication": 0.8,
+        "documentation": 0.8,
+        "risk_buffer": 1.6
+      },
+      "clarification_questions": [
+        "后台管理系统需要哪些统计数据？",
+        "人工客服转接后，是否需要记录对话历史？"
+      ],
+      "customer_feedback": [
+        "常见问题库由我们提供，不需要维护功能",
+        "转接条件是用户输入'转人工'",
+        "不需要集成现有系统",
+        "只需要中文支持"
+      ],
+      "adjustments": {
+        "frontend": -1,
+        "ui_design": -0.5,
+        "ai_engineer": -2,
+        "test": -0.4,
+        "pm": -0.2,
+        "deployment": -0.2
+      },
+      "solved_questions": [
+        {
+          "question": "常见问题库如何建立和维护？",
+          "feedback": "由客户提供，不需要维护功能"
+        },
+        {
+          "question": "转接人工客服的触发条件是什么？",
+          "feedback": "用户输入'转人工'"
+        },
+        {
+          "question": "是否需要集成现有的客服系统？",
+          "feedback": "不需要集成现有系统"
+        },
+        {
+          "question": "系统需要支持哪些语言？",
+          "feedback": "只需要中文支持"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_rounds": 2,
+    "total_clarification_questions": 6,
+    "solved_questions": 4,
+    "unsolved_questions": 2,
+    "total_effort_reduction": 4.3
+  }
+}
