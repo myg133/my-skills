@@ -1,11 +1,11 @@
 ---
-name: agent-workspace-v2
+name: agent-workspace
 description: 统一的 workspace 组织规范，包含目录结构、分支策略、命名规范、各角色工作流、初始化流程和生命周期管理。主 BA Agent 读取此文件后，按角色截取对应部分注入子 agent 的 prompt。
 metadata:
-  short-description: Workspace 组织规范（合并版）
+  short-description: Workspace 组织规范
 ---
 
-# Agent Workspace 组织规范（v2）
+# Agent Workspace 组织规范
 
 ## 目录
 
@@ -298,7 +298,7 @@ agent(
     prompt=f"""
     你是一个 QA Agent。以下是你的工作规范：
     
-    {读取 agent-workspace-v2 中 QA Agent 工作流部分}
+    {读取 agent-workspace 中 QA Agent 工作流部分}
     
     当前任务：为 REQ-xxx 生成测试用例
     工作区：BA/demands/REQ-xxx/
@@ -313,7 +313,7 @@ agent(
     prompt=f"""
     你是一个 Dev Agent。以下是你的工作规范：
     
-    {读取 agent-workspace-v2 中 Dev Agent 工作流部分}
+    {读取 agent-workspace 中 Dev Agent 工作流部分}
     
     当前任务：实现 REQ-xxx
     工作区：feature-REQ-xxx/
