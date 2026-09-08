@@ -2,6 +2,7 @@
 .codewhale/
 workflow-runs.jsonl
 state/
+args
 
 # ── Junction 链接 — 指向外部路径，跨机器无效 ──
 skills/gstack
