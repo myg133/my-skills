@@ -39,7 +39,7 @@ metadata:
 >    - **`/*/` 屏蔽层**：忽略所有第一层子目录（worktree 都在第一层）
 >    - 目的：worktree 目录（`code/` `BA/` `Deploy/` 等）是 embedded git repos，内部有 `.git` file，
 >      如果只靠白名单，`!*/` 会让 git 遍历这些目录，可能误 add 或显示 untracked
->    - `/*/` 从源头阻止任何 worktree 内部文件进入 workspace 分支（详见 `templates/root-gitignore.tpl`）
+>    - `/*/` 从源头阻止任何 worktree 内部文件进入 workspace 分支（详见 `assets/templates/root-gitignore.tpl`）
 > 3. `workspace` 分支**禁止业务代码**（src/、tests/、package.json、CI 配置等）
 > 4. **禁止 worktree 嵌套**：所有 worktree 必须在仓库根第一层，**不允许中间目录层**（如 `workspaces/code/`）
 > 5. **其他 worktree 各自管各自的 `.gitignore`**：
@@ -52,7 +52,7 @@ metadata:
 > **关于"无父的独立分支"**：`workspace` / `demand` / `deploy` 这三个分支是互相无父的 orphan 分支，
 > 各自完整地管理自己的 `.gitignore`，互不依赖。这是 git 工作流中典型的"多根分支"模式。
 >
-> BA Agent 启动时必须做 workspace 巡检，发现违规立即清理（详见 `lifecycle/worktree-audit.md`）。
+> BA Agent 启动时必须做 workspace 巡检，发现违规立即清理（详见 `references/lifecycle/worktree-audit.md`）。
 
 ## 目录结构
 
@@ -77,6 +77,51 @@ metadata:
 
 **所有 worktree 在仓库根平铺**，没有中间目录层、没有 worktree 嵌套。
 **每个 worktree 内部的 `.gitignore` 由对应工作分支跟踪**（无父的独立分支各自管各自的）。
+
+## 本地暂存目录（.local/）
+
+每个 worktree 都有一个 `worktree-root/.local/` 目录，用于存放**未定稿的中间文件**——方案讨论、架构分析、探索报告、设计草稿等。这些文件不进 Git。
+
+### 目录结构
+
+```
+<worktree-root>/
+└── .local/
+    ├── discussions/     # 方案讨论 / 架构探讨记录
+    ├── analysis/        # Explore 报告 / 代码分析
+    ├── drafts/          # 未定稿的设计文档
+    └── references/      # 临时参考资料副本
+```
+
+### 规则
+
+- `.local/` 整个目录被对应 worktree 的 `.gitignore` 忽略（**不跟踪**）
+- 所有中间文件先写在 `.local/` 里，不限格式（`.md`、`.drawio`、截图等）
+- 定稿后**晋升**到 Git 跟踪的目录：`cp .local/drafts/x.md demands/REQ-xxx/ → git add → git commit`
+- 晋升后删除 `.local/` 中的对应文件
+- 纯中间产物（讨论记录、临时分析）不需要晋升，直接留存或清理
+
+### 各 worktree 的 .gitignore 示例
+
+```gitignore
+# 忽略本地暂存目录
+.local/
+
+# 业务相关 ignore 规则...
+```
+
+### 晋升流程（草稿 → 正式文档）
+
+```
+1. 在 .local/drafts/ 中编写草稿
+2. 讨论/修改直到定稿
+3. 晋升：
+   cp .local/drafts/plan.md BA/demands/REQ-xxx/design-summary.md
+   git add BA/demands/REQ-xxx/design-summary.md
+   git commit -m "[BA] 添加 REQ-xxx 设计概要"
+   git push
+4. rm .local/drafts/plan.md（晋升后清理草稿）
+```
 
 ## 分支策略
 
@@ -106,7 +151,9 @@ metadata:
 - **需求编号**: `REQ-{三位数字}`，如 `REQ-001`
 - **分支名**: `feature/REQ-001`, `hotfix/JIRA-123`
 - **Worktree 目录**: `feature-REQ-001`, `hotfix-JIRA-123`（在仓库根平铺）
-- **Commit Message**: `[{区域}] {描述} (关联: {需求ID})`
+- **Commit Message**: `[{区域}] {描述} (关联: {需求ID}) [session: {session-id}]`
+  - 所有对 demand 分支的 commit 必须携带 session ID
+  - 例：`[BA] 更新 REQ-003 状态 (关联: REQ-003) [session: ba-janedoe-mbp-20260915-143022]`
 - **镜像 Tag**: 默认 `{GIT_SHA}`，发布用 `{GIT_TAG}`，特殊可用户指定
 
 ## 工作区定位规则
@@ -128,16 +175,16 @@ metadata:
 
 ### 新建项目
 
-详见 `init/new-project.md`。核心步骤：
+详见 `references/init/new-project.md`。核心步骤：
 
 ```bash
 mkdir my-project && cd my-project
 git init
 git commit --allow-empty -m "[Init] workspace root"
 git branch -m workspace                # 把默认分支改名为 workspace
-# 写 README.md + .gitignore（用 templates/root-readme.md.tpl + templates/root-gitignore.tpl）
-cp <skill-path>/templates/root-readme.md.tpl README.md
-cp <skill-path>/templates/root-gitignore.tpl .gitignore
+# 写 README.md + .gitignore（用 assets/templates/root-readme.md.tpl + assets/templates/root-gitignore.tpl）
+cp <skill-path>/assets/templates/root-readme.md.tpl README.md
+cp <skill-path>/assets/templates/root-gitignore.tpl .gitignore
 git add README.md .gitignore && git commit -m "[Workspace] 初始化导航 + 白名单 .gitignore"
 # 创建主分支
 # main 为生产分支（orphan 独立），develop 从 main 派生
@@ -175,7 +222,7 @@ git push -u origin workspace main develop demand deploy
 
 ### 已有项目迁移
 
-详见 `init/migrate-project.md`。核心原则：**保历史、不动 commit hash、新建 workspace 分支作为新默认**。
+详见 `references/init/migrate-project.md`。核心原则：**保历史、不动 commit hash、新建 workspace 分支作为新默认**。
 
 6 步法骨架：
 
@@ -194,7 +241,98 @@ git push -u origin workspace main develop demand deploy
 
 你位于 `BA/` 目录（`demand` 分支的 worktree），跟 `code/` `Deploy/` 在仓库根平铺。
 所有变更通过 Git 持久化。
-BA Agent 启动时**必须**额外做一次 workspace 巡检（见 `lifecycle/worktree-audit.md` 末节）。
+
+## 多 BA 协作（多个 BA Agent 并行）
+
+当多个 BA Agent 并行工作时，它们共享 `demand` 分支。通过 Git 作为协调原语，所有 BA Agent 遵循**先 pull → 读 → 写 → commit → push** 的原子化流程。
+
+### Session 机制
+
+每个 BA Agent 会话（从启动到关闭）有一个**唯一的 Session ID**，在所有 Git 操作中携带。
+
+**Session ID 格式**：
+
+```
+{role}-{hostname}-{pid}-{YYYYMMDD}-{HHmmss}
+# 例：ba-janedoe-mbp-38472-20260915-143022
+```
+
+Session ID 在会话开始时生成一次，写入本地文件 `BA/.ba/session.md`（不跟踪）：
+
+```markdown
+# Session
+- session_id: ba-janedoe-mbp-38472-20260915-143022
+- started_at: 2026-09-15 14:30:22
+- role: ba
+```
+
+### 懒注册（Lazy Registration）
+
+注册不再作为单独的启动步骤。相反，注册绑定在**第一次写操作**中——BA Agent 对 demand 分支做任何修改时，自动顺带注册：
+
+```
+1. git pull origin demand           # 拉取最新状态
+2. 读 BA/.ba/session.md，获取当前 session ID
+3. 检查 agent-registry.md 中是否已有自己的 session
+   没有 → 追加一行注册（首次写自动注册）
+   已有 → 更新时间戳（心跳）
+4. 执行实际修改（更新 status、创建需求等）
+5. git add <修改的文件> + BA/dispatch/agent-registry.md
+6. git commit -m "[BA] {描述} [session: {session-id}]"
+7. git push origin demand
+   → push 失败 → git pull → 解决冲突 → 重新 push
+```
+
+**注销**：Session 结束时，将 `agent-registry.md` 中对应行的状态改为 `offline`，提交并推送。如果 Session 异常终止（未正常注销），其他 BA 通过**心跳超时**判定为 stale。
+
+### 心跳 & 超时判定
+
+| 机制 | 说明 |
+|------|------|
+| 心跳 | 每次对 demand 分支的 commit 都会更新 registry 中的时间戳 |
+| 超时 | 超过 30 分钟无 commit 的 session 标记为 `stale` |
+| 判定者 | 任意 BA 在巡检时发现并标记 |
+| 恢复 | `stale` 的 session 可被另一个 BA 接管（手动确认） |
+
+### REQ 编号认领
+
+分配新需求前，必须先认领 REQ 编号，防止冲突：
+
+```
+1. git pull origin demand
+2. 读 BA/dispatch/req-registry.md，找下一个可用 REQ 编号
+3. 在 req-registry.md 中写入认领：
+   | REQ-003 | {需求名称} | {session-id} | {时间} |
+4. git commit -m "[BA] 认领 REQ-003 [session: {session-id}]"
+5. git push origin demand
+   → push 成功：认领成功，继续创建 worktree
+   → push 失败（远程已有更新）：git pull → 合并 → 重试认领
+```
+
+**冲突处理**：认领完成后才创建 worktree。如果 push 被拒绝，说明另一个 BA Agent 已经先认领了同一个编号，当前 Agent 自动选择下一个编号重试。
+
+### 历史 Session 管理
+
+- Registry 中保留所有历史记录，不删除
+- 离线或过期的 session 标记为 `offline` 或 `stale`，保留 end_time
+- commit 信息中的 `[session: xxx]` 是追踪的**主要依据**，registry 是辅助摘要
+- 任意 BA 可通过 git log 追溯：`git log --grep="[session:" --oneline`
+
+### Git 操作规范
+
+所有对 `demand` 分支的修改必须走完整周期，**commit 信息必须携带 session ID**：
+
+```
+git pull origin demand        # 1. 拉取最新状态
+# ... 修改文件 ...            # 2. 本地修改
+# 确保同时更新 agent-registry.md（心跳）
+git add <files>               # 3. 暂存
+git commit -m "[BA] {描述} [session: {session-id}]"   # 4. 提交
+git push origin demand        # 5. 推送
+# 若 push 失败：git pull → 解决冲突 → 重新 push
+```
+
+BA Agent 启动时**必须**额外做一次 workspace 巡检（见 `references/lifecycle/worktree-audit.md` 末节）。
 
 ## 核心职责
 
@@ -229,10 +367,17 @@ BA/
 ├── decisions/                     # 架构决策记录 (ADR)
 ├── dispatch/
 │   ├── rules.md                   # 调度规则
-│   ├── registry.md                # Agent 注册表
+│   ├── registry.md                # 子 Agent（Dev/QA/Deploy）注册表
+│   ├── agent-registry.md          # 多 BA Agent 在线注册表
+│   ├── req-registry.md            # REQ 编号认领表
 │   ├── verification-queue.md      # 待验证队列
 │   └── cleanup-log.md             # 回收日志
-└── .ba/                           # 私有工作目录
+├── .ba/                           # 私有工作目录（兼容旧版）
+└── .local/                        # 本地暂存（未定稿中间文件，不跟踪）
+    ├── discussions/
+    ├── analysis/
+    ├── drafts/
+    └── references/
 ```
 
 ## 需求状态流转
@@ -257,28 +402,38 @@ stateDiagram-v2
 ```
 1. 确认需求状态为"已就绪"
 2. 从 dispatch/rules.md 查找可用的 Dev Agent
-3. 创建 feature worktree（在仓库根跑）：
+3. REQ 编号认领（防止多 BA 冲突）：
+   a. git pull origin demand
+   b. 读 BA/dispatch/req-registry.md，选下一个可用编号
+   c. 写入认领记录
+   d. git commit && git push
+   e. 若 push 失败 → git pull → 合并 → 重试
+4. 创建 feature worktree（在仓库根跑）：
    cd <repo-root>
    git worktree add feature-REQ-001 -b feature/REQ-001 develop
-4. 在 .feature/manifest.json 中记录分配信息
-5. 更新需求状态为"进行中"
-6. 创建 QA 子 agent 生成测试用例
-7. 创建 Dev 子 agent 进行开发
+5. 在 .feature/manifest.json 中记录分配信息
+6. 更新需求状态为"进行中"（git pull → 改 status → commit → push）
+7. 创建 QA 子 agent 生成测试用例
+8. 创建 Dev 子 agent 进行开发
 ```
 
 ## 验证审批流程
 
 Dev 开发完成后，BA Agent 负责状态更新和 QA 调度，Dev 不直接更新状态。
+所有对 `demand` 分支的修改必须走 **git pull → 改 → commit → push** 原子周期。
 
 ```
 1. Dev Agent 通知 BA 开发完成
-2. BA 更新需求状态为"待验证"
-3. BA 创建 QA 子 agent，依据测试用例进行代码审核
-4. QA 审核完成，报告结果给 BA
-5. BA 根据审核结果更新状态：
+2. BA git pull origin demand
+3. BA 更新需求状态为"待验证"并 git commit + push
+4. BA 创建 QA 子 agent，依据测试用例进行代码审核
+5. QA 审核完成，报告结果给 BA
+6. BA git pull origin demand
+7. BA 根据审核结果更新状态：
    → 通过：status.md → "已验证"
    → 不通过：status.md → "已退回"（附退回原因）
-6. 状态为"已验证"后，通知 Dev 创建 PR
+8. BA git commit + push
+9. 状态为"已验证"后，通知 Dev 创建 PR
 ```
 
 **关键规则**：
@@ -323,18 +478,25 @@ agent(
 
 ## 巡检兜底
 
-每次启动时执行一次 worktree 巡检（详见 `lifecycle/worktree-audit.md`）：
+每次启动时执行一次 worktree 巡检（详见 `references/lifecycle/worktree-audit.md`）：
 
 1. 扫描所有 `feature-*` 和 `hotfix-*` worktree
 2. 检查分支状态
 3. 已合并但未清理的 → 执行清理
 4. 记录到 `BA/dispatch/cleanup-log.md`
 
-**额外：workspace 巡检**（详见 `lifecycle/worktree-audit.md` 末节）：
+**额外：workspace 巡检**（详见 `references/lifecycle/worktree-audit.md` 末节）：
 
 - 切到仓库根（workspace/ 工作区）
 - `git ls-files` 必须只有 `README.md` + `.gitignore`（两个文件）
 - 任何额外文件都属违规，记录到 `BA/dispatch/cleanup-log.md` 并清理
+
+**额外：agent 注册表巡检**：
+
+- 检查 `BA/dispatch/agent-registry.md` 中标记为 `online` 的 session
+- 用 git log 验证最后活动时间：`git log --grep="[session: {session-id}]" --oneline -1`
+- 超过 30 分钟无活动的 session 标记为 `stale`
+- git commit + push 同步给其他 BA Agent
 
 ---
 
@@ -344,6 +506,10 @@ agent(
 
 你位于 `feature-REQ-xxx/` 目录（`feature/REQ-xxx` 分支的 worktree），由 BA Agent 分配。
 所有 worktree 都在仓库根平铺。
+
+### 本地暂存目录
+
+`feature-REQ-xxx/.local/` 用于存放开发过程中的中间产物（调试笔记、实验代码、架构讨论记录），不跟踪。定稿后晋升到 `src/` 或 `tests/`。
 
 ## 核心职责
 
@@ -431,6 +597,11 @@ agent(
 QA Agent 分两个阶段工作：
 - **Pre-merge**：在 `feature-REQ-xxx/` 目录中做代码级验证
 - **Post-merge**：在 `code/` 目录 + staging 环境做运行时验证
+
+### 本地暂存目录
+
+- Pre-merge 阶段：`feature-REQ-xxx/.local/` 存放测试运行日志、截图、临时报告
+- Post-merge 阶段：`code/.local/` 存放 e2e 测试结果、性能数据
 
 ## 核心职责
 
@@ -558,6 +729,10 @@ CI 的职责：                    Deploy 的职责：
 
 你位于 `Deploy/` 目录（`deploy` 分支的 worktree），跟 `code/` `BA/` 在仓库根平铺。
 
+### 本地暂存目录
+
+`Deploy/.local/` 用于存放部署计划草稿、环境检查记录、回滚预案等，不跟踪。
+
 ## Deploy/ 目录结构
 
 ```
@@ -635,12 +810,12 @@ apps/api-gateway/helm/
 
 | 模板 | 用途 | 复制到 |
 |------|------|--------|
-| `templates/root-readme.md.tpl` | workspace 分支 README（导航 + 快速上手） | `<repo-root>/README.md` |
-| `templates/root-gitignore.tpl` | workspace 分支 .gitignore（**白名单防御机制**） | `<repo-root>/.gitignore` |
-| `templates/demand.md.tpl` | 需求描述 | `BA/demands/REQ-xxx/demand.md` |
-| `templates/acceptance.md.tpl` | 验收标准 | `BA/demands/REQ-xxx/acceptance.md` |
-| `templates/verification-report.md.tpl` | 验证报告 | `BA/demands/REQ-xxx/verification-report.md` 或 `feature-REQ-xxx/.feature/verification-report.md` |
-| `templates/sprint-current.md.tpl` | 迭代计划 | `BA/sprint/current.md` |
+| `assets/templates/root-readme.md.tpl` | workspace 分支 README（导航 + 快速上手） | `<repo-root>/README.md` |
+| `assets/templates/root-gitignore.tpl` | workspace 分支 .gitignore（**白名单防御机制**） | `<repo-root>/.gitignore` |
+| `assets/templates/demand.md.tpl` | 需求描述 | `BA/demands/REQ-xxx/demand.md` |
+| `assets/templates/acceptance.md.tpl` | 验收标准 | `BA/demands/REQ-xxx/acceptance.md` |
+| `assets/templates/verification-report.md.tpl` | 验证报告 | `BA/demands/REQ-xxx/verification-report.md` 或 `feature-REQ-xxx/.feature/verification-report.md` |
+| `assets/templates/sprint-current.md.tpl` | 迭代计划 | `BA/sprint/current.md` |
 
 > **关于 .gitignore**：
 > - workspace 分支**跟踪** `.gitignore`（用白名单机制只允许 README + .gitignore 自己）
@@ -728,7 +903,7 @@ apps/api-gateway/helm/
 
 ## workspace README 模板 (root-readme.md)
 
-模板路径 `templates/root-readme.md.tpl`。生成后的 README 应包含：
+模板路径 `assets/templates/root-readme.md.tpl`。生成后的 README 应包含：
 
 - 项目一句话说明
 - **目录 ↔ 分支对应表**（核心，worktree 全部在仓库根平铺）
@@ -737,7 +912,7 @@ apps/api-gateway/helm/
 
 ## workspace .gitignore 模板 (root-gitignore.tpl)
 
-模板路径 `templates/root-gitignore.tpl`。**双层防御机制**：
+模板路径 `assets/templates/root-gitignore.tpl`。**双层防御机制**：
 
 ```gitignore
 # 1. 忽略所有
