@@ -52,7 +52,7 @@ deadline: 2026-10-22T00:00:00Z
 | `cc` | — | 同上 |
 | `at` | ✅ | RFC3339 UTC（`Z`） |
 | `type` | ✅ | 见下 |
-| `ref` | — | `路径 @ sha`，**不要写分支名** |
+| `ref` | — | **仓库相对路径** `路径 @ sha`，**不要写分支名、不要写本机绝对路径** |
 | `contract`/`version` | contract-* 必填 | 与 `BA/contracts/INDEX.md` 对齐 |
 | `deadline` | — | 超时未 ack 由巡检提醒 |
 | `thread` | — | 话题 id |
@@ -60,6 +60,37 @@ deadline: 2026-10-22T00:00:00Z
 | body | ✅ | ≤ 2000 字符，契约正文放 `BA/contracts/` |
 
 类型：`fyi` `question` `blocker` `handoff` `contract-change` `contract-ack` `decision`。
+
+### 收件人校验
+
+`msg send` 只允许发给**已注册且 active** 的 agent：
+
+| 收件人 | 规则 |
+|--------|------|
+| 具名 `pcA-ba-1` | 在 `BA/plan/agents.json` 中且 `status=active` |
+| `all` | 至少一个 active |
+| `role:ba` | 至少一个该角色 active |
+
+未注册 → 拒绝并列出可用名字。应急可 `--force`，但会在日志里留下痕迹。
+名册由 Planner 用 `aw.py agent register/deactivate` 维护。
+
+### 路径约定（重要）
+
+消息会跨机器读，**不能出现本机绝对路径**：
+
+| 场景 | 写法 |
+|------|------|
+| 引用仓库内文件 | `BA/contracts/user-api/v3.md`（推荐） |
+| 带根占位 | `<repo-root>/BA/contracts/user-api/v3.md` → 发送时自动归一化为相对路径 |
+| 引用代码位置 | `src/auth/login.ts:42` |
+| 禁止 | `C:\proj\BA\...`、`/Users/me/...`、`/home/...`、`\\server\share` |
+
+`aw.py msg send` 会拒绝以上绝对路径（`ref` 和 `body` 都检查），原因有两个：
+
+1. **跨机不可读**：Mac / Linux 上没有 `C:\`；
+2. **泄露目录结构**：用户目录、机器名、项目布局都会进入 bus 历史，且无法撤回。
+
+同理，`.feature/manifest.json` 的 `demand_dir` 也存仓库相对路径，不存本机路径。
 
 ## 4. 寻址与可见性
 
@@ -161,7 +192,31 @@ Notifier 的硬限制（只读、不回复、不 ack）见 `references/roles/not
 | 消息解析失败被忽略 | 检查 `---` 分隔与必填字段；`aw.py msg list --all --full` 看原文 |
 | bus 被误删 | 最后一条消息的 commit 仍在 reflog；用 `git update-ref` 重建 |
 
-## 11. 规模
+## 11. 等待消息（优先于轮询）
+
+能阻塞就不要轮询。MCP 形态下用 `msg_wait`，一次调用最长 120 秒：
+
+```json
+{"timeout":120,"interval":5,"thread":"a1b2","contract":"user-api"}
+```
+
+| 结果 | 返回 | 退出码 |
+|------|------|--------|
+| 命中 | `found:true` + 消息列表 | 0 |
+| 超时 | `found:false` | 3 |
+
+默认**不消费**（不推进已读）；需要消费时加 `consume:true`。
+
+CLI 无 MCP 时可退回轮询，但建议按状态分档（见下）：
+
+| 状态 | 间隔 |
+|------|------|
+| 阻塞等 CI | 1 / 5 / 15 分钟 |
+| 有任务在手 | 15 分钟 |
+| 空闲 | 30 → 60 分钟退避 |
+| 等某个决定 | 2–3 分钟，最多 30 分钟 |
+
+## 12. 规模
 
 | 指标 | 数值 |
 |------|------|

@@ -698,7 +698,8 @@ def read_json(path: Path, default):
 
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # 唯一临时名：并发写同一文件时不会互相踩（Windows 上固定 .tmp 会 WinError 32）
+    tmp = path.with_name("%s.%d.%s.tmp" % (path.name, os.getpid(), secrets.token_hex(2)))
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
@@ -783,8 +784,10 @@ SESSION_TTL_SECONDS = 1800
 
 
 def _session_alive(rec: dict, ttl: int = SESSION_TTL_SECONDS) -> bool:
-    """存活判定：同机优先看长驻进程 pid，其次看心跳新鲜度。"""
+    """存活判定：显式退出 > 同机 pid > 心跳新鲜度。"""
     if not rec:
+        return False
+    if rec.get("status") == "offline":
         return False
     if rec.get("host") == socket.gethostname():
         pid = int(rec.get("pid") or 0)
@@ -798,14 +801,119 @@ def _session_alive(rec: dict, ttl: int = SESSION_TTL_SECONDS) -> bool:
     return (time.time() - ts) < ttl
 
 
-def resolve_identity(root: Path, role: str = "ba") -> dict:
-    agent_id = (os.environ.get("AW_AGENT_ID") or "").strip()
-    if not agent_id:
+def terminal_anchor() -> str:
+    """终端级锚点：同一个终端里的命令共享，不同终端互不相同。
+
+    不依赖 agent 工具注入环境变量——WT_SESSION 等由终端自己设置。
+    """
+    for key in ("WT_SESSION", "TERM_SESSION_ID", "TMUX_PANE", "SSH_TTY", "TTY"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return "%s=%s" % (key, value)
+    return ""
+
+
+def _binding_key(anchor: str) -> str:
+    return "%s|%s" % (socket.gethostname(), anchor)
+
+
+def load_bindings(root: Path) -> dict:
+    return read_json(aw_path(root, "identities.json"), {})
+
+
+def save_bindings(root: Path, data: dict) -> None:
+    write_json(aw_path(root, "identities.json"), data)
+
+
+ROSTER_REL = ("BA", "plan", "agents.json")
+
+
+def roster_path(root: Path) -> Path:
+    return root.joinpath(*ROSTER_REL)
+
+
+def load_roster(root: Path) -> list[dict]:
+    data = read_json(roster_path(root), {})
+    agents = data.get("agents") if isinstance(data, dict) else None
+    return [a for a in (agents or []) if isinstance(a, dict) and a.get("id")]
+
+
+def save_roster(root: Path, agents: list[dict]) -> None:
+    write_json(roster_path(root), {"agents": agents})
+
+
+def active_agents(root: Path) -> set[str]:
+    return {a["id"] for a in load_roster(root) if a.get("status", "active") == "active"}
+
+
+def validate_recipients(root: Path, to: list[str], cc: list[str], force: bool = False) -> None:
+    """收件人必须是已注册且 active 的 agent（或 all / role:x 组）。"""
+    if force:
+        return
+    roster = load_roster(root)
+    if not roster:
+        return  # 未配置 roster：保持向后兼容，不拦
+    known = {a["id"]: a for a in roster}
+    active = active_agents(root)
+    for token in [t for t in to + cc if t]:
+        if token == "all":
+            if not active:
+                raise GitError("没有 active 的 agent，无法广播")
+            continue
+        if token.startswith("role:"):
+            role = token[5:]
+            if not any(a.get("role") == role and a["id"] in active for a in roster):
+                raise GitError("没有 active 的 role:%s" % role)
+            continue
+        if token not in known:
+            sample = ", ".join(sorted(known)[:8])
+            raise GitError("未注册的 agent: %s\n已注册: %s" % (token, sample or "（空）"))
+        if token not in active:
+            raise GitError("%s 不是 active 状态（Planner 可用 agent activate 恢复）" % token)
+
+
+def bind_identity(root: Path, key: str, name: str, force: bool = False) -> tuple[bool, str | None]:
+    """原子绑定：加锁读-改-写，避免并发丢绑定。"""
+    with FileLock(aw_path(root, "locks", "identities.lock"), timeout=10):
+        bindings = load_bindings(root)
+        old = (bindings.get(key) or {}).get("agent_id")
+        if old and old != name and not force:
+            return False, old
+        bindings[key] = {"agent_id": name, "bound_at": _now()}
+        save_bindings(root, bindings)
+        return True, old
+
+
+def resolve_identity(root: Path, role: str = "ba", rebind: bool = False) -> dict:
+    aw_init(root)
+    explicit = (os.environ.get("AW_AGENT_ID") or "").strip()
+    no_bind = os.environ.get("AW_NO_BIND") == "1"
+    anchor = "" if no_bind else terminal_anchor()
+    bindings = load_bindings(root)
+    key = _binding_key(anchor) if anchor else ""
+    bound = bindings.get(key, {})
+    source = os.environ.get("AW_AGENT_SOURCE") or ("env AW_AGENT_ID" if explicit else "")
+
+    if explicit:
+        agent_id = explicit
+        if anchor:
+            ok, old = bind_identity(root, key, agent_id, force=rebind)
+            if not ok:
+                raise GitError(
+                    "这个终端已经绑定 %s，不能改名成 %s。\n"
+                    "要改绑定：aw.py agent bind %s --force" % (old, agent_id, agent_id)
+                )
+            source = source or "--agent"
+    elif bound and bound.get("agent_id"):
+        agent_id = bound["agent_id"]
+        source = "terminal"
+    else:
         raise IdentityError(
             "MISSING_AGENT_ID\n"
             "还没有 agent 名称，不能继续。\n"
-            "请先向用户确认你的名称，然后用 --agent 重新执行：\n"
-            "  aw.py --agent ba-slot-1 <命令>\n"
+            "两种方式（二选一）：\n"
+            "  1) 指定一次，本终端会记住：aw.py --agent pcA-ba-1 agent whoami\n"
+            "  2) 显式绑定：            aw.py agent bind pcA-ba-1\n"
             "如果启动器能设置环境变量，也可以用 AW_AGENT_ID。"
         )
     session_id = (
@@ -829,6 +937,7 @@ def resolve_identity(root: Path, role: str = "ba") -> dict:
         "cwd": str(Path.cwd()),
         "started_at": old.get("started_at") or _now(),
         "last_seen": _now(),
+        "source": source,
     }
     write_json(path, record)
     return record
@@ -904,17 +1013,19 @@ def _create_worktree(root: Path, req: str, base: str) -> None:
     has_branch = git("rev-parse", "--verify", "--quiet", "refs/heads/%s" % branch,
                      cwd=root, check=False).returncode == 0
     last = None
-    for attempt in range(4):
-        try:
-            if has_branch:
-                git("worktree", "add", name, branch, cwd=root)
-            else:
-                git("worktree", "add", name, "-b", branch, base, cwd=root)
-            return
-        except GitError as exc:
-            last = exc
-            time.sleep(0.3 * (2 ** attempt))
-    raise GitError("创建 worktree 失败（重试 4 次）: %s" % last)
+    # 同一仓库并发 worktree add 会撞 .git/worktrees 锁，这里用项目锁串行化
+    with FileLock(aw_path(root, "locks", "worktree.lock"), timeout=30):
+        for attempt in range(5):
+            try:
+                if has_branch:
+                    git("worktree", "add", name, branch, cwd=root)
+                else:
+                    git("worktree", "add", name, "-b", branch, base, cwd=root)
+                return
+            except GitError as exc:
+                last = exc
+                time.sleep(0.3 * (2 ** attempt))
+    raise GitError("创建 worktree 失败（重试 5 次）: %s" % last)
 
 
 def _write_manifest(root: Path, req: str, ident: dict) -> None:
@@ -923,6 +1034,10 @@ def _write_manifest(root: Path, req: str, ident: dict) -> None:
         return
     demands = root / "BA" / "demands"
     demand_dir = next((p for p in demands.glob("%s-*" % req)), demands / req) if demands.is_dir() else demands / req
+    try:
+        demand_rel = demand_dir.relative_to(root).as_posix()
+    except ValueError:
+        demand_rel = "BA/demands/%s" % req
     manifest = {
         "req": req,
         "branch": "feature/%s" % req,
@@ -931,7 +1046,7 @@ def _write_manifest(root: Path, req: str, ident: dict) -> None:
         "owner": ident["agent_id"],
         "base_branch": "develop",
         "created_at": _now(),
-        "demand_dir": str(demand_dir),
+        "demand_dir": demand_rel,   # 仓库相对路径，跨机可读
     }
     write_json(wt / ".feature" / "manifest.json", manifest)
     # 把分配记录提交进 feature 分支：既是审计，也让工作区保持干净（便于回收）
@@ -1155,13 +1270,150 @@ def _finish_claim(root: Path, req: str, ident: dict) -> int:
 
 def cmd_agent(args) -> int:
     root = repo_root()
+    aw_init(root)
+    action = args.action or "whoami"
+    anchor = terminal_anchor()
+    key = _binding_key(anchor) if anchor else ""
+
+    if action == "roster":
+        agents = load_roster(root)
+        if not agents:
+            print("（roster 为空；用 aw.py agent register <name> 注册）")
+            return 0
+        payload = []
+        for a in sorted(agents, key=lambda x: x["id"]):
+            sess = read_json(aw_path(root, "sessions", "%s.json" % a["id"]), {})
+            payload.append({
+                "id": a["id"],
+                "role": a.get("role", "ba"),
+                "status": a.get("status", "active"),
+                "host": a.get("host", ""),
+                "session_alive": bool(_session_alive(sess)),
+            })
+        if getattr(args, "json", False):
+            print(json.dumps({"agents": payload}, ensure_ascii=False, indent=2))
+        else:
+            _table(["agent", "role", "status", "host", "session"],
+                   [[x["id"], x["role"], x["status"], x["host"] or "-",
+                     "alive" if x["session_alive"] else "-"] for x in payload])
+        return 0
+
+    if action in ("register", "activate", "deactivate"):
+        cwd = Path.cwd().resolve()
+        ba = (root / "BA").resolve()
+        allowed = cwd == root.resolve() or cwd == ba or ba in cwd.parents
+        if not allowed:
+            print("请在仓库根或 BA/ 下执行（roster 属于 demand 分支）", file=sys.stderr)
+            return 2
+        name = (args.name or "").strip()
+        if not name:
+            print("用法: aw.py agent %s <name>" % action, file=sys.stderr)
+            return 2
+        agents = load_roster(root)
+        by_id = {a["id"]: a for a in agents}
+        if action == "register":
+            entry = by_id.get(name) or {"id": name, "registered_at": _now()}
+            entry["role"] = args.role or entry.get("role", "ba")
+            entry["host"] = args.host or entry.get("host", socket.gethostname())
+            entry["status"] = "active"
+            entry["updated_at"] = _now()
+            if name not in by_id:
+                agents.append(entry)
+            save_roster(root, agents)
+            print("REGISTERED %s (%s)" % (name, entry["role"]))
+            return 0
+        if name not in by_id:
+            print("未注册的 agent: %s" % name, file=sys.stderr)
+            return 3
+        by_id[name]["status"] = "active" if action == "activate" else "inactive"
+        by_id[name]["updated_at"] = _now()
+        save_roster(root, agents)
+        print("%s %s" % ("ACTIVE" if action == "activate" else "INACTIVE", name))
+        return 0
+
+    if action == "publish":
+        ba = root / "BA"
+        if not ba.is_dir():
+            print("找不到 BA/ 工作区", file=sys.stderr)
+            return 2
+        rel = "plan/agents.json"
+        if not (ba / rel).exists():
+            print("名册不存在：先 agent register", file=sys.stderr)
+            return 3
+        dirty = git("status", "--porcelain", rel, cwd=ba, check=False).stdout.strip()
+        if not dirty:
+            print("NO_CHANGES")
+            return 0
+        git("add", rel, cwd=ba)
+        ident_args = ensure_identity(ba)
+        git(*ident_args, "commit", "-q", "-m", args.message or "[BA] 更新 agent 名册", cwd=ba)
+        if not _has_remote(ba):
+            print("COMMITTED_LOCAL")
+            return 0
+        for attempt in range(3):
+            pushed = git("push", "-q", "origin", "demand", cwd=ba, check=False, timeout=30)
+            if pushed.returncode == 0:
+                print("PUBLISHED")
+                return 0
+            git("pull", "--rebase", "-q", "origin", "demand", cwd=ba, check=False, timeout=30)
+            time.sleep(0.5 * (2 ** attempt))
+        print("PUSH_FAILED（本地已提交，稍后重试 push）", file=sys.stderr)
+        return 3
+
+    if action == "exit":
+        ident = resolve_identity(root)
+        claims = [c for c in load_claims(root)
+                  if c.get("agent_id") == ident["agent_id"] and c.get("state") in CLAIM_STATES]
+        if claims and not args.force:
+            print("还有认领未释放: %s" % ", ".join(c["req"] for c in claims), file=sys.stderr)
+            print("先 claim release，或加 --force 强制退出（认领会变成死会话）", file=sys.stderr)
+            return 3
+        sess_path = aw_path(root, "sessions", "%s.json" % ident["agent_id"])
+        sess = read_json(sess_path, {})
+        sess["status"] = "offline"
+        sess["ended_at"] = _now()
+        write_json(sess_path, sess)
+        if not args.keep_binding and key:
+            bindings = load_bindings(root)
+            bindings.pop(key, None)
+            save_bindings(root, bindings)
+        print("EXITED %s" % ident["agent_id"])
+        print("  claims : %d" % len(claims))
+        print("  binding: %s" % ("kept" if args.keep_binding else ("removed" if key else "-")))
+        return 0
+
+    if action in ("bind", "unbind"):
+        if not anchor:
+            print("当前环境没有终端锚点（WT_SESSION / TERM_SESSION_ID / TTY），只能用 --agent。",
+                  file=sys.stderr)
+            return 2
+        if action == "bind":
+            name = (args.name or "").strip()
+            if not name:
+                print("用法: aw.py agent bind <name> [--force]", file=sys.stderr)
+                return 2
+            ok, old = bind_identity(root, key, name, force=args.force)
+            if not ok:
+                print("这个终端已经绑定 %s；要改绑加 --force" % old, file=sys.stderr)
+                return 3
+            print("BOUND %s" % name)
+            print("  anchor: %s" % anchor)
+            return 0
+        bindings = load_bindings(root)
+        bindings.pop(key, None)
+        save_bindings(root, bindings)
+        print("UNBOUND %s" % anchor)
+        return 0
+
     ident = resolve_identity(root)
-    source = os.environ.get("AW_AGENT_SOURCE") or ("env AW_AGENT_ID" if os.environ.get("AW_AGENT_ID") else "unknown")
+    reg = next((a for a in load_roster(root) if a["id"] == ident["agent_id"]), None)
     print("agent_id : %s" % ident["agent_id"])
     print("session  : %s" % ident["session_id"])
     print("role     : %s" % ident["role"])
     print("repo     : %s" % root)
-    print("source   : %s" % source)
+    print("source   : %s" % ident.get("source", "unknown"))
+    print("anchor   : %s" % (anchor or "（无终端锚点）"))
+    print("roster   : %s" % (reg.get("status", "active") if reg else "未注册"))
     return 0
 
 
@@ -1227,6 +1479,34 @@ def _now_utc() -> str:
 
 def _msg_id() -> str:
     return secrets.token_hex(4)
+
+
+ABS_PATH_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z]:[\\/]"),   # C:\ 或 C:/（不误伤 https://）
+    re.compile(r"^\\\\"),                             # UNC \\server\share
+    re.compile(r"(?<![A-Za-z0-9:.])/(?:Users|home|root|mnt)/"),  # /Users/x /home/x
+)
+
+
+def _has_abs_path(text: str) -> bool:
+    return any(p.search(text or "") for p in ABS_PATH_PATTERNS)
+
+
+def normalize_ref(ref: str) -> str:
+    """ref 必须是仓库相对路径；拒绝本机绝对路径，统一用 /。"""
+    value = (ref or "").strip().replace("\\", "/")
+    if not value:
+        return ""
+    value = re.sub(r"^<repo-root>/", "", value)
+    value = re.sub(r"^\./", "", value)
+    if _has_abs_path(value) or value.startswith("/"):
+        raise GitError(
+            "ref 不能是本机绝对路径（跨机器不可读，也会泄露目录结构）。\n"
+            "请改成仓库相对路径，例如：BA/contracts/user-api/v3.md"
+        )
+    if value.startswith("../"):
+        raise GitError("ref 请用仓库相对路径（如 BA/contracts/x.md），不要用 ../ 回到仓库根。")
+    return value
 
 
 def parse_message(text: str) -> dict | None:
@@ -1383,6 +1663,10 @@ def load_bus_messages(root: Path, fetch: bool = True) -> list[dict]:
         if meta and meta.get("id"):
             meta["_sha"] = sha
             messages.append(meta)
+    # git log 是「新 → 旧」，反转成「旧 → 新」：消息顺序等于提交顺序，不受时钟影响
+    messages.reverse()
+    for idx, meta in enumerate(messages):
+        meta["_seq"] = idx
     return messages
 
 
@@ -1487,10 +1771,24 @@ def cmd_msg(args) -> int:
             raise GitError("--body 不能为空")
         if len(body) > 2000:
             raise GitError("body 超过 2000 字符，请把正文放进 BA/contracts/ 或 BA/decisions/")
+        ref = normalize_ref(args.ref)
+        if _has_abs_path(body):
+            raise GitError(
+                "消息正文里不要放本机绝对路径（跨机器不可读，也会泄露目录结构）。\n"
+                "用仓库相对路径，例如：BA/contracts/user-api/v3.md"
+            )
+        validate_recipients(root, to, cc, force=getattr(args, "force", False))
+        roster = load_roster(root)
+        if roster and not getattr(args, "force", False):
+            me = next((a for a in roster if a["id"] == ident["agent_id"]), None)
+            if not me:
+                raise GitError("发送者未注册: %s（先 aw.py agent register）" % ident["agent_id"])
+            if me.get("status") != "active":
+                raise GitError("发送者不是 active: %s" % ident["agent_id"])
         meta = {
             "id": _msg_id(), "from": ident["agent_id"], "to": to, "cc": cc,
             "at": _now_utc(), "type": args.type, "body": body,
-            "ref": args.ref or "", "contract": args.contract or "",
+            "ref": ref, "contract": args.contract or "",
             "version": args.version or "", "deadline": args.deadline or "",
             "thread": args.thread or "", "priority": args.priority or "p2",
             "subject": args.subject or (args.contract or ""),
@@ -1520,7 +1818,7 @@ def cmd_msg(args) -> int:
             messages = [m for m in messages if m.get("from") == args.sender]
         if args.since:
             messages = [m for m in messages if (m.get("at") or "") >= args.since]
-        messages.sort(key=lambda m: (m.get("at", ""), m.get("id", "")))
+        messages.sort(key=lambda m: m.get("_seq", 0))
         universe = {m.get("id") for m in messages if m.get("id")}
         if action == "inbox" and not args.all:
             read = _read_ids(root, ident["agent_id"], messages)
@@ -1547,6 +1845,45 @@ def cmd_msg(args) -> int:
             _write_read_ids(root, ident["agent_id"],
                             {m["id"] for m in show if m.get("id")}, universe)
         return 0
+
+    if action == "wait":
+        deadline = time.time() + max(1, int(args.timeout))
+        interval = max(1, int(args.interval))
+        while True:
+            candidates = _unread_for(root, ident)
+            if args.thread:
+                candidates = [m for m in candidates if m.get("thread") == args.thread]
+            if args.contract:
+                candidates = [m for m in candidates if m.get("contract") == args.contract]
+            if args.type:
+                candidates = [m for m in candidates if m.get("type") == args.type]
+            if args.sender:
+                candidates = [m for m in candidates if m.get("from") == args.sender]
+            if candidates:
+                if args.json:
+                    fields = ("id", "from", "to", "at", "type", "subject", "contract",
+                              "version", "ref", "thread", "body")
+                    print(json.dumps({"found": True, "count": len(candidates),
+                                      "messages": [{k: m.get(k) for k in fields if m.get(k)}
+                                                   for m in candidates]},
+                                     ensure_ascii=False, indent=2))
+                else:
+                    for m in candidates:
+                        print(_msg_line(m, ident, full=True))
+                if args.consume:
+                    _write_read_ids(root, ident["agent_id"],
+                                    {m["id"] for m in candidates if m.get("id")},
+                                    {m["id"] for m in load_bus_messages(root, fetch=False) if m.get("id")})
+                return 0
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if args.json:
+                    print(json.dumps({"found": False, "count": 0, "messages": []},
+                                     ensure_ascii=False))
+                else:
+                    print("WAIT_TIMEOUT")
+                return 3
+            time.sleep(min(interval, remaining))
 
     if action == "show":
         target = next((m for m in load_bus_messages(root, fetch=not args.no_fetch)
@@ -1689,6 +2026,7 @@ def cmd_contract(args) -> int:
         latest_change = next((m for m in reversed(changes)
                               if m.get("contract") == name
                               and (not current or _ver_num(m.get("version", 0)) == current)), None)
+        # changes 是「旧 → 新」，reversed 后第一个匹配即最新一次变更
         if latest_change:
             acked = {m.get("from") for m in acks
                      if m.get("contract") == name
@@ -1905,6 +2243,7 @@ def _subparser_list(parser: argparse.ArgumentParser) -> list[argparse.ArgumentPa
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aw.py", description="Agent Workspace 工具")
     parser.add_argument("--agent", default=None, help="agent_id（优先于 AW_AGENT_ID）")
+    parser.add_argument("--no-bind", action="store_true", help="不读写终端绑定（一个终端跑多个 agent 时用）")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="初始化一个新的 workspace 项目")
@@ -1944,8 +2283,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_claim.add_argument("--ignore-unread", action="store_true", help="忽略未读消息强制认领")
     p_claim.set_defaults(func=cmd_claim)
 
-    p_agent = sub.add_parser("agent", help="查看当前 agent 身份")
-    p_agent.add_argument("action", choices=["whoami", "check"], nargs="?", default="whoami")
+    p_agent = sub.add_parser("agent", help="查看/绑定当前 agent 身份")
+    p_agent.add_argument("action",
+                         choices=["whoami", "check", "bind", "unbind", "register", "roster",
+                                  "activate", "deactivate", "exit", "publish"],
+                         nargs="?", default="whoami")
+    p_agent.add_argument("name", nargs="?", default="")
+    p_agent.add_argument("--force", action="store_true", help="bind 强制改绑 / exit 强制退出")
+    p_agent.add_argument("--role", default="", help="register 时的角色")
+    p_agent.add_argument("--host", default="", help="register 时的机器名")
+    p_agent.add_argument("--keep-binding", action="store_true", help="exit 时保留终端绑定")
+    p_agent.add_argument("--json", action="store_true", help="roster 输出 JSON")
+    p_agent.add_argument("--message", default="", help="publish 的提交信息")
     p_agent.set_defaults(func=cmd_agent)
 
     p_contract = sub.add_parser("contract", help="契约一致性检查")
@@ -1956,7 +2305,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_contract.set_defaults(func=cmd_contract)
 
     p_msg = sub.add_parser("msg", help="BA 间消息（空 commit 走 bus 分支）")
-    p_msg.add_argument("action", choices=["send", "inbox", "list", "ack", "flush", "show"])
+    p_msg.add_argument("action", choices=["send", "inbox", "list", "ack", "flush", "show", "wait"])
     p_msg.add_argument("--json", action="store_true", help="机器可读输出")
     p_msg.add_argument("id", nargs="?", default="")
     p_msg.add_argument("--to", default="", help="收件人，逗号分隔；支持 all / role:ba / agent_id")
@@ -1977,6 +2326,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.add_argument("--full", action="store_true")
     p_msg.add_argument("--no-fetch", action="store_true")
     p_msg.add_argument("--no-advance", action="store_true", help="只读，不推进游标（Notifier 用）")
+    p_msg.add_argument("--force", action="store_true", help="跳过收件人注册校验")
+    p_msg.add_argument("--timeout", type=int, default=120, help="wait 最长秒数（默认 120）")
+    p_msg.add_argument("--interval", type=int, default=5, help="wait 轮询间隔秒数")
+    p_msg.add_argument("--consume", action="store_true", help="wait 命中后标记已读")
     p_msg.add_argument("--ok", action="store_true", help="ack 时表示同意（默认）")
     p_msg.add_argument("--note", default="", help="ack 附言")
     p_msg.add_argument("--reject", action="store_true", help="ack 时表示不同意")
@@ -1996,6 +2349,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 允许 --agent 写在子命令后面：aw.py msg inbox --agent ba-1
     for subparser in _subparser_list(parser):
         subparser.add_argument("--agent", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        subparser.add_argument("--no-bind", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return parser
 
 
@@ -2026,11 +2380,16 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["AW_AGENT_SOURCE"] = "--agent"
     elif os.environ.get("AW_AGENT_ID"):
         os.environ.setdefault("AW_AGENT_SOURCE", "env AW_AGENT_ID")
+    if getattr(args, "no_bind", False):
+        os.environ["AW_NO_BIND"] = "1"
     try:
         return args.func(args)
     except IdentityError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except TimeoutError as exc:
+        print("等待锁超时: %s" % exc, file=sys.stderr)
+        return 1
     except GitError as exc:
         print("错误: %s" % exc, file=sys.stderr)
         return 1

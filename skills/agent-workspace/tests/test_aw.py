@@ -24,6 +24,8 @@ def run(args, cwd, agent="ba-test", extra_env=None):
     env = dict(os.environ)
     env.pop("AW_AGENT_ID", None)
     env.pop("AW_SESSION_ID", None)
+    for key in ("WT_SESSION", "TERM_SESSION_ID", "TMUX_PANE", "SSH_TTY", "TTY"):
+        env.pop(key, None)
     if agent:
         env["AW_AGENT_ID"] = agent
         env["AW_SESSION_ID"] = "sess-" + agent
@@ -39,6 +41,15 @@ def run(args, cwd, agent="ba-test", extra_env=None):
 def git(args, cwd):
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, encoding="utf-8", errors="replace")
+
+
+MCP = AW.parent / "aw_mcp.py"
+
+
+def mcp_exchange(proc, payload):
+    proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline())
 
 
 class WorkspaceCase(unittest.TestCase):
@@ -60,6 +71,84 @@ class WorkspaceCase(unittest.TestCase):
         self.assertIn("branch refs/heads/demand", wt)
         self.assertIn("branch refs/heads/deploy", wt)
         self.assertTrue((self.repo / "BA" / "dispatch" / "agent-registry.md").exists())
+
+    @staticmethod
+    def _stop_mcp(proc):
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _mcp(self, agent="ba-1"):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("AW_AGENT_ID", "AW_SESSION_ID", "AW_AGENT_PID")}
+        if agent:
+            env["AW_AGENT_ID"] = agent
+        return subprocess.Popen(
+            [sys.executable, str(MCP)], cwd=str(self.repo), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+
+    def test_mcp_handshake_and_whoami(self):
+        proc = self._mcp()
+        try:
+            init = mcp_exchange(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                       "params": {"protocolVersion": "2024-11-05"}})
+            self.assertEqual(init["result"]["serverInfo"]["name"], "aw-mcp")
+            tools = mcp_exchange(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            names = {t["name"] for t in tools["result"]["tools"]}
+            self.assertIn("claim_next", names)
+            self.assertIn("msg_send", names)
+            self.assertIn("msg_wait", names)
+            call = mcp_exchange(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                       "params": {"name": "agent_whoami", "arguments": {}}})
+            payload = json.loads(call["result"]["content"][0]["text"])
+            self.assertEqual(payload["exit_code"], 0)
+            self.assertIn("ba-1", payload["stdout"])
+            self.assertFalse(call["result"]["isError"])
+        finally:
+            self._stop_mcp(proc)
+
+    def test_mcp_requires_agent_id(self):
+        proc = self._mcp(agent=None)
+        try:
+            call = mcp_exchange(proc, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": {"name": "agent_whoami", "arguments": {}}})
+            self.assertTrue(call["result"]["isError"])
+            self.assertIn("MISSING_AGENT_ID", call["result"]["content"][0]["text"])
+        finally:
+            self._stop_mcp(proc)
+
+    def _mcp_tool(self, proc, name, args, rid=10):
+        return mcp_exchange(proc, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                   "params": {"name": name, "arguments": args}})
+
+    def test_mcp_register_and_roster(self):
+        proc = self._mcp()
+        try:
+            reg = self._mcp_tool(proc, "agent_register", {"name": "pcA-ba-1", "role": "ba"})
+            payload = json.loads(reg["result"]["content"][0]["text"])
+            self.assertEqual(payload["exit_code"], 0, payload)
+            roster = self._mcp_tool(proc, "agent_roster", {}, rid=11)
+            data = json.loads(json.loads(roster["result"]["content"][0]["text"])["stdout"])
+            self.assertEqual(data["agents"][0]["id"], "pcA-ba-1")
+        finally:
+            self._stop_mcp(proc)
+
+    def test_agent_publish_commits_roster(self):
+        run(["agent", "register", "pcA-ba-1"], self.repo / "BA", agent=None)
+        out = run(["agent", "publish"], self.repo, agent=None)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("COMMITTED_LOCAL", out.stdout)
+        log = git(["log", "--oneline", "-1"], self.repo / "BA").stdout
+        self.assertIn("agent 名册", log)
 
     def test_verify_clean(self):
         out = run(["verify"], self.repo)
@@ -94,14 +183,18 @@ class WorkspaceCase(unittest.TestCase):
             run(["queue", "add", "REQ-%03d" % i], self.repo)
         procs = []
         for i in range(1, 4):
-            env = dict(os.environ, AW_AGENT_ID="slot-%d" % i, AW_SESSION_ID="s%d" % i)
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("WT_SESSION", "TERM_SESSION_ID", "TMUX_PANE", "SSH_TTY", "TTY")}
+            env.update(AW_AGENT_ID="slot-%d" % i, AW_SESSION_ID="s%d" % i,
+                       WT_SESSION="test-term-%d" % i)
             procs.append(subprocess.Popen(
                 [sys.executable, str(AW), "claim", "next"], cwd=str(self.repo),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 encoding="utf-8", errors="replace", env=env))
-        outs = [p.communicate()[0] for p in procs]
+        results = [(p.communicate(), p.returncode) for p in procs]
+        outs = [r[0][0] for r in results]
         claimed = sorted(line.split()[1] for line in outs for line in [line] if "CLAIMED" in line)
-        self.assertEqual(len(claimed), 3, outs)
+        self.assertEqual(len(claimed), 3, [(o, e, rc) for ((o, e), rc) in results])
         self.assertEqual(len(set(claimed)), 3, outs)
 
     # ---- 身份 ----
@@ -109,6 +202,66 @@ class WorkspaceCase(unittest.TestCase):
         out = run(["claim", "next"], self.repo, agent=None)
         self.assertEqual(out.returncode, 2, out.stdout)
         self.assertIn("MISSING_AGENT_ID", out.stderr)
+
+    def _register(self, *names):
+        for name in names:
+            out = run(["agent", "register", name], self.repo / "BA", agent=None)
+            self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_roster_rejects_unknown_recipient(self):
+        self._register("ba-1")
+        bad = run(["msg", "send", "--to", "ghost", "--body", "x"], self.repo, agent="ba-1")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("未注册", bad.stderr)
+
+    def test_roster_rejects_inactive(self):
+        self._register("ba-1", "ba-2")
+        run(["agent", "deactivate", "ba-2"], self.repo / "BA", agent=None)
+        bad = run(["msg", "send", "--to", "ba-2", "--body", "x"], self.repo, agent="ba-1")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("不是 active", bad.stderr)
+
+    def test_agent_exit_unbinds(self):
+        env = {"WT_SESSION": "term-exit"}
+        run(["agent", "bind", "ba-1"], self.repo, agent=None, extra_env=env)
+        out = run(["agent", "exit"], self.repo, agent=None, extra_env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        again = run(["agent", "whoami"], self.repo, agent=None, extra_env=env)
+        self.assertEqual(again.returncode, 2)
+
+    def test_agent_exit_refuses_with_claims(self):
+        run(["queue", "add", "REQ-001"], self.repo, agent="ba-1")
+        run(["claim", "next"], self.repo, agent="ba-1")
+        out = run(["agent", "exit"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("认领", out.stderr)
+
+    def test_terminal_binding_resolves(self):
+        env = {"WT_SESSION": "term-test-1"}
+        run(["agent", "bind", "ba-1"], self.repo, agent=None, extra_env=env)
+        out = run(["agent", "whoami"], self.repo, agent=None, extra_env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("ba-1", out.stdout)
+        self.assertIn("terminal", out.stdout)
+
+    def test_terminal_binding_blocks_rename(self):
+        env = {"WT_SESSION": "term-test-2"}
+        run(["agent", "bind", "ba-1"], self.repo, agent=None, extra_env=env)
+        bad = run(["agent", "whoami", "--agent", "ba-2"], self.repo, agent=None, extra_env=env)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("已经绑定", bad.stderr)
+
+    def test_terminal_isolated(self):
+        run(["agent", "bind", "ba-1"], self.repo, agent=None, extra_env={"WT_SESSION": "term-A"})
+        other = run(["agent", "whoami"], self.repo, agent=None, extra_env={"WT_SESSION": "term-B"})
+        self.assertEqual(other.returncode, 2)
+
+    def test_no_bind_allows_explicit(self):
+        env = {"WT_SESSION": "term-shared"}
+        run(["agent", "bind", "ba-1"], self.repo, agent=None, extra_env=env)
+        out = run(["agent", "whoami", "--agent", "ba-2", "--no-bind"], self.repo, agent=None, extra_env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("ba-2", out.stdout)
 
     def test_agent_flag_without_env(self):
         out = run(["agent", "whoami", "--agent", "ba-x"], self.repo, agent=None)
@@ -144,6 +297,19 @@ class WorkspaceCase(unittest.TestCase):
         self.assertIn("→ me", first.stdout)
         second = run(["msg", "inbox"], b, agent="pcB")
         self.assertIn("无消息", second.stdout)
+
+    def test_msg_wait_immediate(self):
+        run(["msg", "send", "--to", "ba-1", "--body", "ping"], self.repo, agent="ba-1")
+        out = run(["msg", "wait", "--timeout", "3", "--json"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        data = json.loads(out.stdout)
+        self.assertTrue(data["found"])
+        self.assertEqual(data["messages"][0]["body"], "ping")
+
+    def test_msg_wait_timeout(self):
+        out = run(["msg", "wait", "--timeout", "2", "--interval", "1"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("WAIT_TIMEOUT", out.stdout)
 
     def test_msg_ack(self):
         a, b = self._make_pair()
@@ -210,6 +376,32 @@ class WorkspaceCase(unittest.TestCase):
         run(["msg", "inbox"], self.repo, agent="ba-1")
         other = run(["msg", "inbox", "--full"], self.repo, agent="ba-2")
         self.assertIn("broadcast", other.stdout)
+
+    def test_msg_ref_must_be_relative(self):
+        bad = run(["msg", "send", "--to", "all", "--body", "x",
+                   "--ref", "C:\\proj\\BA\\a.md"], self.repo, agent="ba-1")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("绝对路径", bad.stderr)
+
+    def test_msg_ref_normalizes_repo_root(self):
+        run(["msg", "send", "--to", "all", "--body", "x",
+             "--ref", "<repo-root>/BA/contracts/a.md"], self.repo, agent="ba-1")
+        out = run(["msg", "list", "--all", "--json"], self.repo, agent="ba-1")
+        self.assertIn('"ref": "BA/contracts/a.md"', out.stdout)
+
+    def test_msg_body_rejects_abs_path(self):
+        bad = run(["msg", "send", "--to", "all",
+                   "--body", "见 C:\\Users\\me\\proj\\a.md"], self.repo, agent="ba-1")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("绝对路径", bad.stderr)
+
+    def test_manifest_demand_dir_is_relative(self):
+        run(["queue", "add", "REQ-001"], self.repo, agent="ba-1")
+        run(["claim", "next"], self.repo, agent="ba-1")
+        manifest = json.loads((self.repo / "feature-REQ-001" / ".feature" / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        self.assertTrue(manifest["demand_dir"].startswith("BA/demands/"), manifest["demand_dir"])
+        self.assertNotIn(":", manifest["demand_dir"])
 
     def test_bus_has_no_files(self):
         a, _ = self._make_pair()
