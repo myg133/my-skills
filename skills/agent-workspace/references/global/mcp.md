@@ -62,22 +62,130 @@ aw.py mcp print                   # 打印通用 JSON（手工粘贴）
 - 每个 agent 用同一份配置，只改 `AW_AGENT_ID`；
 - 没有 `AW_AGENT_ID` 时服务照常启动，但每次工具调用返回 `MISSING_AGENT_ID`。
 
+## 2.1 没有环境变量时：每次调用带 agent_id
+
+桌面端 agent 往往拿不到 `AW_AGENT_ID`。这种情况下，**每个工具都接受一个可选的 `agent_id` 参数**：
+
+```json
+{"name": "agent_whoami", "arguments": {"agent_id": "pcA-ba-1"}}
+```
+
+```json
+{"name": "msg_send", "arguments": {
+  "agent_id": "pcA-ba-1",
+  "to": "pcB-ba-1",
+  "type": "contract-change",
+  "body": "v3 增加 mfaToken"
+}}
+```
+
+规则：
+
+| 情况 | 身份来源 |
+|------|---------|
+| 调用带 `agent_id` | 用它（优先） |
+| 没带，但进程有 `AW_AGENT_ID` | 用环境变量 |
+| 都没有 | `MISSING_AGENT_ID`，不执行 |
+
+注意：
+
+- `agent_id` 是**自报**的，工具只能校验它是否在 roster 里、是否 active，不能证明"你就是他"；
+- 桌面端如果多个会话共用一个 MCP 服务进程，**必须每次带 `agent_id`**，否则无法区分；
+- 这个参数会作为 `--agent` 传给 `aw.py`，行为与 CLI 完全一致。
+
+## 2.2 令牌：防止冒名
+
+只靠 `agent_id` 是自报的，任何 agent 都能填别人的名字。开启令牌后：
+
+```bash
+aw.py agent register pcA-ba-1 --role ba --issue-token
+# REGISTERED pcA-ba-1 (ba)
+# TOKEN pcA-ba-1 3f9c...（只显示一次）
+```
+
+令牌是**按 agent 开启**的：`--issue-token` 自动生成，`--token <t>` 指定已有值；
+不带这两个参数就不启用校验（向后兼容）。
+
+- roster 只存 **SHA-256 哈希**，不存明文；
+- 把 token 交给对应 agent（写进它的系统提示或私有配置），**不要提交到仓库**；
+- 之后每次 MCP 调用带上：
+
+```json
+{"name": "msg_send", "arguments": {
+  "agent_id": "pcA-ba-1",
+  "token": "3f9c...",
+  "to": "all",
+  "body": "..."
+}}
+```
+
+- 也可以设置环境变量 `AW_AGENT_TOKEN`；
+- CLI 侧对应 `--agent-token <t>`（全局参数）；
+- token 缺失或错误 → `BAD_TOKEN`，工具不执行；
+- 轮换：`aw.py agent token pcA-ba-1`，旧 token 立即失效。
+
+> 仍不完美：token 会出现在该 agent 的上下文里，理论上可被读取；
+> 但它不会出现在**其他** agent 的上下文里，所以跨会话冒名被挡住了。
+> 注册入口本身仍是信任式的——能写 `BA/plan/agents.json` 的人才能注册。
+
 ## 3. 工具
 
 | 工具 | 作用 |
 |------|------|
-| `agent_whoami` / `agent_roster` | 身份与名册 |
+| `agent_whoami` / `agent_check` / `agent_roster` | 身份、一致性与名册 |
 | `agent_register` / `agent_activate` / `agent_deactivate` | 注册与启停 |
 | `agent_publish` | 把名册提交并推送到 demand，其他机器可见 |
-| `claim_next` / `claim_take` / `claim_release` / `claim_list` / `claim_doctor` | 认领 |
-| `msg_send` / `msg_inbox` / `msg_show` / `msg_ack` | 消息 |
+| `next_req` / `claim_next` / `claim_take` / `claim_release` / `claim_list` / `claim_doctor` | 认领 |
+| `msg_send` / `msg_inbox` / `msg_show` / `msg_ack` / `msg_list` / `msg_flush` | 消息 |
 | `msg_wait` | 阻塞等新消息（≤120 秒，默认不消费） |
 | `contract_check` | 契约门禁 |
-| `verify` / `audit` | 自检 |
+| `verify` / `audit` / `doctor` / `stats` | 自检与指标 |
 | `queue_add` / `queue_list` / `queue_sync` | 队列 |
 
 参数与 CLI 一一对应；schema 里有枚举与必填项，agent 不需要读源码。
 
+## 3.1 CLI → MCP 对照
+
+agent 运行时不要 shell 调 `aw.py`；用同名工具。参数名基本一致（下划线/连字符差异见下）。
+
+| CLI | MCP 工具 | 备注 |
+|-----|----------|------|
+| `aw.py verify` | `verify` | |
+| `aw.py audit` | `audit` | |
+| `aw.py doctor` | `doctor` | |
+| `aw.py stats` | `stats` | 固定 JSON |
+| `aw.py contract check` | `contract_check` | |
+| `aw.py next-req` | `next_req` | |
+| `aw.py claim next` | `claim_next` | `--ignore-unread` → `ignore_unread` |
+| `aw.py claim take REQ` | `claim_take` | `req` |
+| `aw.py claim release REQ` | `claim_release` | `remove_worktree` / `force` |
+| `aw.py claim list` | `claim_list` | |
+| `aw.py claim doctor` | `claim_doctor` | `repair` |
+| `aw.py msg send` | `msg_send` | 字段同名 |
+| `aw.py msg inbox` | `msg_inbox` | `all` / `limit` / `full` |
+| `aw.py msg list` | `msg_list` | 含已读，审计用 |
+| `aw.py msg show ID` | `msg_show` | |
+| `aw.py msg ack ID` | `msg_ack` | `reject` / `note` |
+| `aw.py msg flush` | `msg_flush` | |
+| `aw.py msg wait` | `msg_wait` | `timeout` / `consume` |
+| `aw.py queue add REQ` | `queue_add` | |
+| `aw.py queue list` | `queue_list` | |
+| `aw.py queue sync` | `queue_sync` | |
+| `aw.py agent whoami` | `agent_whoami` | |
+| `aw.py agent check` | `agent_check` | |
+| `aw.py agent roster` | `agent_roster` | |
+| `aw.py agent register` | `agent_register` | |
+| `aw.py agent activate/deactivate` | `agent_activate` / `agent_deactivate` | |
+| `aw.py agent publish` | `agent_publish` | |
+| `aw.py agent exit` | `agent_exit` | |
+| `aw.py agent bind/unbind` | — | MCP 用 `agent_id` 参数，不需要绑定 |
+| `aw.py agent bootstrap` | — | 人类一次性操作，仅 CLI |
+| `aw.py agent token` | — | 人类运维，仅 CLI |
+| `aw.py init/migrate/upgrade` | — | 人类运维，仅 CLI |
+| `aw.py mcp install` | — | 安装 MCP 本身，只能 CLI |
+
+> 不能通过 MCP 执行 `bootstrap` / `token`：它们需要"系统外"的信任，
+> 由人执行才成立（见 planner.md §0）。
 ## 4. 返回格式
 
 每个工具返回一段 JSON 文本：

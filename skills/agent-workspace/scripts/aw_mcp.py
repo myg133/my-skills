@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -32,10 +33,14 @@ def log(*args) -> None:
     print(*args, file=sys.stderr, flush=True)
 
 
-def run_aw(argv: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
+def run_aw(argv: list[str], agent: str | None = None, token: str | None = None,
+           timeout: int = 180) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    if AGENT:
-        env["AW_AGENT_ID"] = AGENT
+    identity = (agent or AGENT or "").strip()
+    if identity:
+        env["AW_AGENT_ID"] = identity
+    if token:
+        env["AW_AGENT_TOKEN"] = token
     env.setdefault("AW_AGENT_PID", str(os.getpid()))
     env.setdefault("AW_SESSION_ID", "proc-%d" % os.getpid())
     return subprocess.run(
@@ -46,12 +51,24 @@ def run_aw(argv: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
 
 
 def tool(name: str, description: str, props: dict, required: list[str] | None = None) -> dict:
+    # 每个工具都可以显式带 agent_id：桌面端没有环境变量时靠它认人
+    properties = {
+        "agent_id": {
+            "type": "string",
+            "description": "调用者身份；未设置 AW_AGENT_ID 时必填（如 pcA-ba-1）",
+        },
+        "token": {
+            "type": "string",
+            "description": "agent 令牌；注册时由 agent register 一次性打印，用于证明身份",
+        },
+    }
+    properties.update(props)
     return {
         "name": name,
         "description": description,
         "inputSchema": {
             "type": "object",
-            "properties": props,
+            "properties": properties,
             "required": required or [],
             "additionalProperties": False,
         },
@@ -73,6 +90,7 @@ TOOLS = [
          {"message": STR}),
     tool("agent_exit", "退出：session 置 offline、解绑终端",
          {"force": BOOL, "keep_binding": BOOL}),
+    tool("next_req", "取下一个待认领需求（等价 claim next）", {}),
     tool("claim_next", "原子认领队首需求；已有认领或存在未读消息时拒绝",
          {"ignore_unread": {**BOOL, "description": "忽略未读消息强制认领"}}),
     tool("claim_take", "认领指定需求（同样受 WIP=1 限制）", {"req": STR}, ["req"]),
@@ -97,9 +115,15 @@ TOOLS = [
           "sender": STR, "consume": BOOL, "json": BOOL}),
     tool("msg_show", "按 id 查看单条消息", {"id": STR}, ["id"]),
     tool("msg_ack", "对契约变更回执", {"id": STR, "reject": BOOL, "note": STR}, ["id"]),
+    tool("msg_list", "列出 bus 上的消息（含已读，用于审计）",
+         {"all": BOOL, "limit": INT, "json": BOOL}),
+    tool("msg_flush", "把离线队列推到 bus 分支", {}),
     tool("contract_check", "检查契约版本 pin、consumer 覆盖与未 ack 变更",
          {"strict": BOOL, "no_fetch": BOOL, "json": BOOL}),
     tool("verify", "校验 workspace 硬约束", {"strict": BOOL, "json": BOOL}),
+    tool("doctor", "一页巡检：workspace / 拓扑 / 认领 / 队列 / 契约", {}),
+    tool("stats", "运营指标（JSON）：WIP、队列年龄、ack 中位数", {}),
+    tool("agent_check", "检查当前身份、绑定与工作区是否一致", {}),
     tool("audit", "只读巡检：拓扑、僵尸 worktree、stale session",
          {"stale_minutes": INT}),
     tool("queue_add", "把需求加入待认领队列", {"req": STR, "title": STR}, ["req"]),
@@ -135,6 +159,8 @@ def build_argv(name: str, args: dict) -> list[str]:
         if a.get("keep_binding"):
             argv.append("--keep-binding")
         return argv
+    if name == "next_req":
+        return ["next-req"]
     if name == "claim_next":
         return ["claim", "next"] + (["--ignore-unread"] if a.get("ignore_unread") else [])
     if name == "claim_take":
@@ -181,6 +207,16 @@ def build_argv(name: str, args: dict) -> list[str]:
         return argv
     if name == "msg_show":
         return ["msg", "show", a["id"], "--json"]
+    if name == "msg_list":
+        argv = ["msg", "list"]
+        if a.get("all"):
+            argv.append("--all")
+        if a.get("limit"):
+            argv += ["--limit", str(a["limit"])]
+        argv.append("--json")
+        return argv
+    if name == "msg_flush":
+        return ["msg", "flush"]
     if name == "msg_ack":
         argv = ["msg", "ack", a["id"]]
         if a.get("reject"):
@@ -194,6 +230,12 @@ def build_argv(name: str, args: dict) -> list[str]:
             if a.get(key):
                 argv.append("--" + key.replace("_", "-"))
         return argv
+    if name == "doctor":
+        return ["doctor"]
+    if name == "stats":
+        return ["stats", "--json"]
+    if name == "agent_check":
+        return ["agent", "check"]
     if name == "verify":
         argv = ["verify"]
         for key in ("strict", "json"):
@@ -217,21 +259,70 @@ def build_argv(name: str, args: dict) -> list[str]:
     raise ValueError("unknown tool: %s" % name)
 
 
+def _repo_root() -> Path | None:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=os.getcwd(), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        ).stdout.strip()
+        if not out:
+            return None
+        if os.name == "nt":
+            import re
+            match = re.match(r"^/([A-Za-z])/(.*)$", out)
+            if match:
+                return Path("%s:/%s" % (match.group(1).upper(), match.group(2))).resolve().parent
+        return Path(out).resolve().parent
+    except Exception:
+        return None
+
+
+def _roster_entry(agent: str) -> dict | None:
+    root = _repo_root()
+    if root is None:
+        return None
+    try:
+        data = json.loads((root / "BA" / "plan" / "agents.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for entry in data.get("agents") or []:
+        if entry.get("id") == agent:
+            return entry
+    return None
+
+
 def call_tool(name: str, args: dict) -> dict:
-    if not AGENT:
+    identity = (str(args.get("agent_id") or "").strip()) or AGENT
+    if not identity:
         return {
             "content": [{"type": "text", "text":
                          "MISSING_AGENT_ID\n"
-                         "本 MCP 服务没有收到 AW_AGENT_ID。\n"
-                         "请在每个 agent 的启动环境里设置：AW_AGENT_ID=pcA-ba-1"}],
+                         "没有 agent 身份。二选一：\n"
+                         "  1) 每次调用带参数 agent_id（桌面端推荐）\n"
+                         "  2) 启动环境设置 AW_AGENT_ID=pcA-ba-1"}],
             "isError": True,
         }
+    entry = _roster_entry(identity) or {}
+    auth_token = (str(args.get("token") or "").strip()
+                  or (os.environ.get("AW_AGENT_TOKEN") or "").strip())
+    if entry.get("token_hash"):
+        supplied = auth_token
+        if not supplied or hashlib.sha256(supplied.encode("utf-8")).hexdigest() != entry["token_hash"]:
+            return {
+                "content": [{"type": "text", "text":
+                             "BAD_TOKEN\n"
+                             "该 agent 已启用令牌校验。请带上注册时打印的 token，"
+                             "或设置 AW_AGENT_TOKEN。"}],
+                "isError": True,
+            }
     try:
         argv = build_argv(name, args)
+        argv = ["--agent", identity, *argv]
     except (KeyError, ValueError) as exc:
         return {"content": [{"type": "text", "text": "参数错误: %s" % exc}], "isError": True}
     try:
-        proc = run_aw(argv)
+        proc = run_aw(argv, agent=identity, token=auth_token)
     except subprocess.TimeoutExpired:
         return {"content": [{"type": "text", "text": "命令超时: %s" % name}], "isError": True}
 
@@ -240,7 +331,7 @@ def call_tool(name: str, args: dict) -> dict:
         "exit_code": proc.returncode,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
-        "agent": AGENT,
+        "agent": identity,
     }
     # 3/4 是业务状态（ALREADY_HOLDING / UNREAD_MESSAGES），当作正常返回
     return {

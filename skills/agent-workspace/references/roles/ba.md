@@ -12,15 +12,49 @@
 | 派单对象 | Dev / QA / Deploy / Explore 子 Agent |
 | 状态权 | **独占** `status.md` |
 
-## 2. 每次启动必做
+## 1.1 注册自己（每个 agent 第一次启动）
 
-```bash
-cd <repo-root>/BA
-git pull --rebase origin demand
-python <skill>/scripts/aw.py audit          # 只读巡检，输出表格
+BA **自己注册**，不需要 Planner 代劳：
+
+```text
+agent_register {"name": "pcA-ba-1", "role": "ba"}
+# REGISTERED pcA-ba-1 (ba, pending)
+# TOKEN pcA-ba-1 3f9c...
 ```
 
-巡检项（`aw.py audit` 已覆盖，人工只需看结论）：
+- **solo 模式**（没有 active Planner）：直接 `active`；
+- **team 模式**：先 `pending`，Planner 执行 `agent_activate` 后才能收发消息；
+- 记下 `TOKEN`，后续调用带上（或设 `AW_AGENT_TOKEN`）；
+- 名字已被占用时，重新注册需要本人 token 或 Planner token。
+
+## 1.2 默认自决（防止变笨）
+
+**你是需求所有者，细节默认你拍板。** Planner 只定顺序、跨 BA 边界、不可逆事项。
+
+| 你决定 | 你升级 |
+|--------|--------|
+| 字段名、错误码、重试、日志 | 跨 BA 契约冲突 |
+| 验收标准、测试数据 | 优先级 / 范围变更 |
+| 需求拆分、内部先后 | 数据迁移 / 公开 API 等不可逆 |
+| 单 REQ 技术选型（约束内） | 文档互相矛盾 |
+
+- 问之前先查 `plan/roadmap.md`、`plan/queue-policy.md`、`decisions/`；
+- 升级必须带 **proposal + default**（2 小时无回复就按 default 执行）；
+- 自决结果写进 `decisions.md`，Planner 周检，不逐条审批。
+
+详见 `references/global/decision-rights.md`。
+
+## 2. 每次启动必做
+
+> 本角色通过 MCP 调用工具，示例写作 `工具名 {参数}`。
+> CLI 等价命令见 `references/global/mcp.md`；agent 不要 shell 调 `aw.py`。
+
+```text
+git pull --rebase origin demand   # git 仍用命令行
+audit {}
+```
+
+巡检项（`audit` 已覆盖，人工只需看结论）：
 
 1. workspace 分支是否仍只跟踪 2 个文件；
 2. worktree 拓扑是否合规（无中间层、无嵌套）；
@@ -35,11 +69,12 @@ python <skill>/scripts/aw.py audit          # 只读巡检，输出表格
 ```text
 1. 与用户对齐：目标、边界、验收标准（不懂就先派 Explore 摸底）
 2. 读 BA/.ba/session.md，没有则生成 session_id
-3. 认领编号：aw.py next-req → 写 req-registry.md → commit+push
+3. 认领编号：next_req {} → 写 req-registry.md → commit+push
 4. 建目录：demands/REQ-xxx-{slug}/（你在 BA/ 里，相对路径即可）
    demand.md（模板 demand.md.tpl）
    acceptance.md（模板 acceptance.md.tpl，每条 AC 可测）
    status.md（模板 status.md.tpl）
+   decisions.md（模板 decisions.md.tpl，BA 自决记录）
 5. 派 QA 生成测试用例 → 写入 test-cases/（由 BA 提交）
 6. 状态推到 已就绪，commit+push
 ```
@@ -48,11 +83,11 @@ python <skill>/scripts/aw.py audit          # 只读巡检，输出表格
 
 **不要手工 `git worktree add`。** 认领是唯一入口，worktree 是它的副产物。
 
-```bash
-# AW_AGENT_ID 在启动时注入，整个会话不变
-export AW_AGENT_ID=ba-slot-1
-python <skill>/scripts/aw.py claim next
+```text
+claim_next {}
 ```
+
+身份来自 MCP 调用的 `agent_id` + `token`（桌面端每次带；终端启动可继承 `AW_AGENT_ID`）。
 
 输出只有几种，按返回值分支：
 
@@ -69,14 +104,14 @@ python <skill>/scripts/aw.py claim next
 
 配套命令：
 
-```bash
-aw.py claim whoami                 # 我是谁、我拿着什么
-aw.py claim list                   # 谁在做什么
-aw.py claim release REQ-003        # 交回（worktree 保留）
-aw.py claim release REQ-003 --remove-worktree   # 交回并回收
-aw.py claim doctor [--repair]      # 查一人多单 / 死会话 / 孤儿 worktree
-aw.py queue add REQ-004 --title "..."   # 入队
-aw.py queue sync                   # 从 BA/demands 扫"已就绪"
+```text
+agent_whoami {}
+claim_list {}
+claim_release {"req": "REQ-003"}
+claim_release {"req": "REQ-003", "remove_worktree": true}
+claim_doctor {"repair": false}
+queue_add {"req": "REQ-004", "title": "..."}
+queue_sync {}
 ```
 
 > `BA/dispatch/req-registry.md` 和 `agent-registry.md` 现在是**只读快照**，
@@ -86,12 +121,13 @@ aw.py queue sync                   # 从 BA/demands 扫"已就绪"
 
 消息只走 `bus` 分支的空 commit，不进 demand：
 
-```bash
-aw.py msg send --to pcB-ba-1 --type contract-change \
-  --contract user-api --version 3 --body "增加 mfaToken" --ref "BA/contracts/user-api/v3.md"
-aw.py msg inbox          # 只显示发给我的增量
-aw.py msg list --all     # 看全队，输出会标 → me / → 别人
-aw.py msg ack <id> --ok  # 契约回执
+```text
+msg_send {"to": "pcB-ba-1", "type": "contract-change",
+          "contract": "user-api", "version": "3",
+          "body": "增加 mfaToken", "ref": "BA/contracts/user-api/v3.md"}
+msg_inbox {}
+msg_list {"all": true}
+msg_ack {"id": "<id>"}
 ```
 
 同步点：**认领前、派单前、合并前、完成时**各读一次 inbox。
@@ -134,9 +170,8 @@ git push origin demand
 
 ## 6. 回收
 
-```bash
-cd <repo-root>
-python <skill>/scripts/aw.py claim release REQ-003 --remove-worktree
+```text
+claim_release {"req": "REQ-003", "remove_worktree": true}
 git branch -d feature/REQ-003
 git push origin --delete feature/REQ-003
 ```
@@ -151,7 +186,7 @@ git push origin --delete feature/REQ-003
 - **Planner 定方向**：优先级、范围、跨 BA 契约方向、容量。
 - **你定落地**：需求文档、验收标准、派单、状态。
 - Planner 的结论看 `BA/plan/queue-policy.md` 与 `BA/decisions/`；
-  有异议在 bus 上发 `type: question`，不要私下改 `demand.md` 绕过。
+  有异议在 bus 上发 `type: question`，**必须带 proposal + default**，不要私下改 `demand.md` 绕过。
 - 你**不改** `plan/`，Planner **不改** `status.md`。
 
 ## 7. 硬规则

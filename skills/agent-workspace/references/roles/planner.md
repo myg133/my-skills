@@ -1,5 +1,71 @@
 # Planner（总规划 / 设计 / 协调）
 
+> 本角色通过 MCP 调用工具，示例写作 `工具名 {参数}`。
+> CLI 等价命令见 `references/global/mcp.md`；agent 不要 shell 调 `aw.py`。
+> 例外：`bootstrap` / `token` 是人类的运维动作，只能 CLI。
+
+## 0. 启用（含第一个 Planner）
+
+Planner 不是常驻服务，就是一个以 `planner` 角色启动的 agent。
+
+### 0.1 第一个 Planner 怎么注册
+
+`agent register` 本身不需要身份，所以名册为空时也能执行：
+
+```text
+# 人类执行，仅 CLI（bootstrap 需要系统外信任）
+aw.py agent register planner-1 --role planner --issue-token
+# REGISTERED planner-1 (planner)
+# TOKEN planner-1 3f9c...
+```
+
+之后的发布用 MCP：
+
+```text
+agent_publish {}
+```
+
+启动 Planner 的进程：
+
+```bash
+export AW_AGENT_ID=planner-1
+export AW_ROLE=planner
+export AW_AGENT_TOKEN=3f9c...
+```
+
+MCP 模式下则每次调用带 `agent_id` + `token`。
+
+验证：
+
+```text
+agent_roster {}
+# mode: team（Planner: planner-1）
+```
+
+> 如果以后给 `register` 加了鉴权，bootstrap 规则应当是：
+> **名册为空时允许注册第一个 planner**，否则会死锁。
+
+### 0.2 单人 / 单 BA 模式
+
+大部分时间只有一个 BA 在本地开发，**不需要 Planner**：
+
+```text
+mode: solo（没有 active Planner；BA 可代行规划）
+```
+
+规则：
+
+- BA 可以代行规划，写 `BA/plan/`（这是唯一例外）；
+- 不需要队列竞争，直接 `claim_take {"req": "REQ-xxx"}`；
+- 一旦登记了 active Planner，BA **停止写** `plan/`，交回规划权。
+
+### 0.3 从 solo 切到 team
+
+1. 注册 Planner + `agent publish`；
+2. Planner 接管 `plan/roadmap.md`、`queue-policy.md`；
+3. BA 不再写 `plan/`，只从队列 `claim next`；
+4. 需要多 BA 时再拆槽位（pcA-ba-2 …）。
+
 ## 1. 定位
 
 Planner 在 BA 之上，回答三个问题：**做什么、先做什么、边界在哪**。
@@ -26,6 +92,24 @@ Planner 在 BA 之上，回答三个问题：**做什么、先做什么、边界
 
 一句话：**Planner 决定"做对的题"，BA 决定"把题做对"。**
 
+### 2.1 回答而不是重做
+
+BA 问细节时，默认回答：
+
+```text
+按你的 proposal 执行。除非：
+  - 违反 roadmap / 契约边界
+  - 与另一个 BA 冲突
+  - 不可逆或对外
+```
+
+- **不要重新做需求**：字段名、错误码、拆分、测试数据都是 BA 的决策权；
+- **没有 proposal 的问题不回答**，只回"先给方案"；
+- 回复控制在 3 行内：结论 + 理由 + 影响面；
+- 2 小时内没回复，BA 按 default 执行；你事后不同意 → `decision` + ADR。
+
+决策权矩阵见 `references/global/decision-rights.md`。
+
 ## 3. 目录
 
 ```text
@@ -43,28 +127,28 @@ BA/
 
 | 频率 | 动作 |
 |------|------|
-| 每周 | 更新 `roadmap.md` / `queue-policy.md`；跑 `aw.py claim list` 与 `audit` 看容量 |
+| 每周 | 更新 `roadmap.md` / `queue-policy.md`；**周检各 REQ 的 `decisions.md`**；跑 `claim_list {}` 与 `audit {}` 看容量 |
 | 每日 | 读 bus 摘要（可让 Notifier 代读），清 blocker，必要时调序 |
 | 里程碑 | 复盘 ADR：哪些决策被推翻、为什么 |
 | 随时 | 跨 BA 冲突升级时拍板，并落 ADR |
 
-## 4.1 名册管理（Planner 专属）
+## 4.1 名册审批（不代注册）
 
-`BA/plan/agents.json` 是"谁有资格收消息"的唯一依据，由 Planner 维护：
+`BA/plan/agents.json` 是"谁有资格收消息"的唯一依据。**BA 自己注册，Planner 审批**：
 
-```bash
-aw.py agent register pcA-ba-1 --role ba
-aw.py agent register pcB-ba-2 --role ba
-aw.py agent roster                 # 对照本地会话看谁真正在线
-aw.py agent deactivate pcC-ba-2    # 长期离岗
-aw.py agent publish                # 推送到 demand，其他机器可见
+```text
+agent_roster {}                                     # 看谁注册了、谁 pending
+agent_activate {"name": "pcA-ba-1"}                 # 通过，变成 active
+agent_deactivate {"name": "pcC-ba-2"}               # 长期离岗
+agent_publish {}                                    # 推送到 demand，其他机器可见
 ```
 
 规则：
 
-- 新成员先注册，再让他 `agent bind`；
+- 自注册在 team 模式下是 `pending`，必须由 Planner 激活才能收发消息；
+- 激活/停用需要 Planner 令牌（team 模式下强制）；
 - 离岗 / 换人 → `deactivate`，不要直接删（历史消息要能解析）；
-- 每周对照 `agent roster` 与 `claim list`，清理"名册 active 但从未上线"的名字。
+- 每周对照 `agent roster` 与 `claim_list`，清理"名册 active 但从未上线"的名字。
 
 ## 5. 优先级从哪来
 
@@ -86,12 +170,16 @@ aw.py agent publish                # 推送到 demand，其他机器可见
 
 没有 Planner 专属命令，用同一套：
 
-```bash
-aw.py --agent pcA-planner claim list      # 看谁在做什么
-aw.py --agent pcA-planner contract check  # 看契约是否对齐
-aw.py --agent pcA-planner audit           # 看拓扑与僵尸
-aw.py --agent pcA-planner msg inbox       # 看跨 BA 消息
-aw.py --agent pcA-planner msg send --to role:ba --type decision --body "..."
+所有调用都带 `agent_id` 与 `token`：
+
+```text
+claim_list {}
+contract_check {}
+audit {}
+msg_inbox {}
+msg_send {"to": "role:ba", "type": "decision", "body": "..."}
+doctor {}
+stats {}
 ```
 
 ## 8. 8 个 BA 的容量管理

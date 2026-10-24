@@ -100,15 +100,29 @@ aw.py --agent <错名> claim release REQ-xxx --force
 
 `BA/plan/agents.json`，由 Planner 维护，随 `demand` 分支跨机器共享。
 
-```bash
-aw.py agent register pcA-ba-1 --role ba     # 注册 / 重新激活
-aw.py agent publish                         # 提交并推送名册到 demand
-aw.py agent roster --json                   # 看名单与本地会话
-aw.py agent deactivate pcA-ba-2             # 停用（不再接收消息）
-aw.py agent activate pcA-ba-2               # 恢复
+```text
+agent_register {"name": "pcA-ba-1", "role": "ba"}   # BA 自注册
+agent_roster {}                                     # 看名单与本地会话
+agent_publish {}                                    # 推送名册到 demand
+agent_activate {"name": "pcA-ba-2"}                 # Planner 审批
+agent_deactivate {"name": "pcA-ba-3"}               # 停用
 ```
 
+自注册在 team 模式下是 `pending`，由 Planner 激活；solo 模式直接 `active`。
+
 注册只写本地文件；**必须 `agent publish` 推送到 demand，其他机器才看得到**。
+
+注册时加 `--issue-token`（或 `--token <t>`）会启用令牌并打印一次：
+
+```text
+TOKEN pcA-ba-1 3f9c...
+```
+
+- roster 只存哈希；
+- token 交给对应 agent（提示或私有配置），不要提交；
+- MCP 调用带 `token` 参数，或设置 `AW_AGENT_TOKEN`；
+- CLI 用 `--agent-token <t>`；
+- 轮换：`aw.py agent token <name>`。
 其他机器 `git pull --rebase` 后才能 `agent roster` 看到新人。
 
 `msg send` 会校验收件人：

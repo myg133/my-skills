@@ -3,7 +3,7 @@ name: agent-workspace
 description: 基于 Git worktree 的多 Agent 协作工作区规范，面向中大型、多需求并行、需要可追溯交付的项目（小型脚本或一次性任务不适用）。用于初始化或迁移项目为 workspace 布局（workspace 根容器 + code/BA/Deploy 平铺 worktree）、按 Planner/BA/Dev/QA/Deploy/Explore 角色分工开发、管理需求状态机与 REQ 编号、巡检与回收 worktree、发布与回滚。当用户要建立项目工作区、搭多 agent 开发流水线、规范分支/worktree/提交、迁移已有仓库到 worktree 结构、或排查 worktree 拓扑与 workspace 分支污染时使用。
 metadata:
   short-description: Git worktree 多 Agent 协作工作区
-  version: 1.16.0
+  version: 1.23.0
 ---
 
 # Agent Workspace
@@ -97,6 +97,7 @@ python <skill-path>/scripts/aw.py audit
 | 你是 | 先读 | 再读 |
 |------|------|------|
 | **Planner** | `references/roles/planner.md` | `global/state-machine.md`、`global/messaging.md` |
+| **单人 / 单 BA** | `references/roles/planner.md` §0.2 | 无需 Planner，BA 可代行规划 |
 | **BA** | `references/roles/ba.md` | `global/concurrency.md`、`global/state-machine.md` |
 | **Dev** | `references/roles/dev.md` | `global/paths.md` |
 | **QA** | `references/roles/qa.md` | `global/state-machine.md`（写入权） |
@@ -109,6 +110,8 @@ python <skill-path>/scripts/aw.py audit
 | 升级已运行的项目 | `references/lifecycle/upgrade.md` | `aw.py upgrade` |
 | BA 之间沟通 | `references/global/messaging.md` | `aw.py msg` |
 | 通过 MCP 调用 | `references/global/mcp.md` | 工具名见上表 |
+| 该不该问 Planner | `references/global/decision-rights.md` | 决策权矩阵 + 升级协议 |
+
 | 接口/契约对齐 | `references/global/contracts.md` | `aw.py contract check` |
 | 我是谁 / 没名字 | `references/global/identity.md` | `aw.py agent whoami` |
 | 代读消息 | `references/roles/notifier.md` | 只读子 agent |
@@ -135,6 +138,13 @@ ROOT="$(git rev-parse --path-format=absolute --git-common-dir | xargs dirname)"
 > 不同客户端会给工具名加前缀：DSH 是 `mcp__aw__claim_next`，Claude/Cursor 是原名。
 > 判断"MCP 是否可用"时按**后缀**匹配，不要精确等于。
 
+**没有 `AW_AGENT_ID` 时**（桌面端常见）：每个工具都可以带上 `agent_id` 参数自报身份，
+例如 `{"name":"msg_send","arguments":{"agent_id":"pcA-ba-1","to":"all","body":"..."}}`。
+带参数优先于环境变量。
+
+如果 roster 里该 agent 有 `token_hash`，还必须带 `token`（注册时打印的一次性令牌），
+否则返回 `BAD_TOKEN`。令牌用于防止跨会话冒名，轮换用 `aw.py agent token <name>`。
+
 | 组 | 工具 |
 |----|------|
 | 身份 / 名册 | `agent_whoami` `agent_roster` `agent_register` `agent_activate` `agent_deactivate` `agent_publish` `agent_exit` |
@@ -153,7 +163,11 @@ ROOT="$(git rev-parse --path-format=absolute --git-common-dir | xargs dirname)"
 
 **能阻塞就不要轮询**：等消息用 `msg_wait`（≤120 秒），不要每 5 秒调一次 `msg_inbox`。
 
-MCP 与 CLI 等价；客户端不支持 MCP 时用 `aw.py` + `AW_AGENT_ID`。
+**agent 运行时一律走 MCP**。CLI 只用于人类/CI 的运维命令：
+`init` / `migrate` / `upgrade` / `agent bootstrap` / `agent token` / `mcp install`。
+
+文档里的 `aw.py xxx` 是等价形式；MCP 工具名与参数映射见
+`references/global/mcp.md` 的「CLI → MCP 对照」。
 
 ### 使用策略（硬规则）
 
@@ -177,6 +191,8 @@ MCP 与 CLI 等价；客户端不支持 MCP 时用 `aw.py` + `AW_AGENT_ID`。
 | `aw.py verify` | 校验硬约束（可挂 CI / pre-commit） | 0 通过，1 违规 |
 | `aw.py audit` | 只读巡检，输出四段报告 | 0 干净，1 有问题 |
 | `aw.py upgrade` | 旧项目升级检查（只读）：补什么/清什么/改什么 | 0 无需动作，1 有待处理 |
+| `aw.py doctor` | 一页巡检：workspace/拓扑/认领/队列/契约/模式 | 0 正常，1 有 FAIL |
+| `aw.py stats [--json]` | 运营指标：WIP、队列年龄、ack 中位数、每 REQ 提问数 | 0 |
 | `aw.py msg send/inbox/ack/wait` | BA 间消息（空 commit 走 `bus` 分支；wait 阻塞 ≤120s） | 0 成功，3 排队/超时 |
 | `aw.py contract check` | 契约一致性：pin 版本、consumer 缺失、未 ack | 0 通过，1 有问题 |
 | `aw.py agent bind/roster/exit` | 绑定终端、维护名册、退出会话（防漂移） | 0 成功，2/3 失败 |
