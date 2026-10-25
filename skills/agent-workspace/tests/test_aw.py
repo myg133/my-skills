@@ -522,6 +522,47 @@ class WorkspaceCase(unittest.TestCase):
         out = run(["msg", "list", "--all", "--json"], self.repo, agent="ba-1")
         self.assertIn('"ref": "BA/contracts/a.md"', out.stdout)
 
+    def test_claim_blocked_by_pending_reply(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "question",
+             "--body", "行不行"], self.repo, agent="ba-1")
+        run(["queue", "add", "REQ-001"], self.repo, agent="ba-1")
+        blocked = run(["claim", "next"], self.repo, agent="ba-2")
+        self.assertEqual(blocked.returncode, 4)
+        self.assertIn("PENDING_REPLIES", blocked.stdout)
+        run(["msg", "inbox"], self.repo, agent="ba-2")
+        ok = run(["claim", "next", "--ignore-pending"], self.repo, agent="ba-2")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("CLAIMED", ok.stdout)
+
+    def test_exit_blocked_by_pending_reply(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "question",
+             "--body", "行不行"], self.repo, agent="ba-1")
+        blocked = run(["agent", "exit"], self.repo, agent="ba-2")
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("未回复", blocked.stderr)
+        forced = run(["agent", "exit", "--force"], self.repo, agent="ba-2")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+
+    def test_msg_expect_pending_reply(self):
+        sent = run(["msg", "send", "--to", "ba-2", "--type", "question",
+                    "--body", "这样拆行不行？"], self.repo, agent="ba-1")
+        mid = re.search(r"SENT(?:_LOCAL)? ([0-9a-f]+)", sent.stdout).group(1)
+        show = json.loads(run(["msg", "show", mid], self.repo, agent="ba-1").stdout)
+        self.assertEqual(show["expect"], "reply")
+        pend = json.loads(run(["msg", "pending", "--json"], self.repo, agent="ba-2").stdout)
+        self.assertEqual(pend["count"], 1)
+        reply = run(["msg", "reply", mid, "--body", "可以，按这个拆"], self.repo, agent="ba-2")
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        pend2 = json.loads(run(["msg", "pending", "--json"], self.repo, agent="ba-2").stdout)
+        self.assertEqual(pend2["count"], 0)
+
+    def test_msg_fyi_expects_none(self):
+        sent = run(["msg", "send", "--to", "ba-2", "--type", "fyi",
+                    "--body", "知会一下"], self.repo, agent="ba-1")
+        mid = re.search(r"SENT(?:_LOCAL)? ([0-9a-f]+)", sent.stdout).group(1)
+        show = json.loads(run(["msg", "show", mid], self.repo, agent="ba-1").stdout)
+        self.assertEqual(show["expect"], "none")
+
     def test_msg_body_too_large_hint(self):
         bad = run(["msg", "send", "--to", "all", "--body", "x" * 2001], self.repo, agent="ba-1")
         self.assertEqual(bad.returncode, 1)

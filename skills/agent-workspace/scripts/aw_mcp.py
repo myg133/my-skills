@@ -91,9 +91,11 @@ TOOLS = [
     tool("agent_exit", "退出：session 置 offline、解绑终端",
          {"force": BOOL, "keep_binding": BOOL}),
     tool("next_req", "取下一个待认领需求（等价 claim next）", {}),
-    tool("claim_next", "原子认领队首需求；已有认领或存在未读消息时拒绝",
-         {"ignore_unread": {**BOOL, "description": "忽略未读消息强制认领"}}),
-    tool("claim_take", "认领指定需求（同样受 WIP=1 限制）", {"req": STR}, ["req"]),
+    tool("claim_next", "原子认领队首需求；已有认领、未读或欠回复时拒绝",
+         {"ignore_unread": {**BOOL, "description": "忽略未读消息强制认领"},
+          "ignore_pending": {**BOOL, "description": "忽略未回复消息强制认领"}}),
+    tool("claim_take", "认领指定需求（同样受 WIP=1 限制）",
+         {"req": STR, "ignore_pending": BOOL}, ["req"]),
     tool("claim_release", "释放认领；可选回收 worktree",
          {"req": STR, "remove_worktree": BOOL, "force": BOOL}, ["req"]),
     tool("claim_list", "列出当前所有认领", {}),
@@ -105,6 +107,8 @@ TOOLS = [
                                                 "contract-change", "contract-ack", "decision"]},
           "cc": STR, "subject": STR, "ref": STR, "contract": STR, "version": STR,
           "deadline": STR, "thread": STR, "priority": STR,
+          "expect": {**STR, "enum": ["none", "ack", "reply"]},
+          "reply_by": STR,
           "force": {**BOOL, "description": "跳过收件人注册校验"}},
          ["to", "body"]),
     tool("msg_inbox", "读取发给我的未读消息", {"all": BOOL, "limit": INT, "full": BOOL,
@@ -117,6 +121,9 @@ TOOLS = [
     tool("msg_ack", "对契约变更回执", {"id": STR, "reject": BOOL, "note": STR}, ["id"]),
     tool("msg_list", "列出 bus 上的消息（含已读，用于审计）",
          {"all": BOOL, "limit": INT, "json": BOOL}),
+    tool("msg_pending", "列出等我还账的消息（expect=ack/reply 且尚未回复）", {}),
+    tool("msg_reply", "回复某条消息；自动带 re / thread / 收件人",
+         {"id": STR, "body": STR, "type": STR}, ["id", "body"]),
     tool("msg_flush", "把离线队列推到 bus 分支", {}),
     tool("contract_check", "检查契约版本 pin、consumer 覆盖与未 ack 变更",
          {"strict": BOOL, "no_fetch": BOOL, "json": BOOL}),
@@ -162,9 +169,17 @@ def build_argv(name: str, args: dict) -> list[str]:
     if name == "next_req":
         return ["next-req"]
     if name == "claim_next":
-        return ["claim", "next"] + (["--ignore-unread"] if a.get("ignore_unread") else [])
+        argv = ["claim", "next"]
+        if a.get("ignore_unread"):
+            argv.append("--ignore-unread")
+        if a.get("ignore_pending"):
+            argv.append("--ignore-pending")
+        return argv
     if name == "claim_take":
-        return ["claim", "take", a["req"]]
+        argv = ["claim", "take", a["req"]]
+        if a.get("ignore_pending"):
+            argv.append("--ignore-pending")
+        return argv
     if name == "claim_release":
         argv = ["claim", "release", a["req"]]
         if a.get("remove_worktree"):
@@ -180,9 +195,12 @@ def build_argv(name: str, args: dict) -> list[str]:
         argv = ["msg", "send", "--to", a["to"], "--body", a["body"]]
         if a.get("type"):
             argv += ["--type", a["type"]]
-        for key in ("cc", "subject", "ref", "contract", "version", "deadline", "thread", "priority"):
+        for key in ("cc", "subject", "ref", "contract", "version", "deadline",
+                    "thread", "priority", "reply_by"):
             if a.get(key):
                 argv += ["--" + key, str(a[key])]
+        if a.get("expect"):
+            argv += ["--expect", a["expect"]]
         if a.get("force"):
             argv.append("--force")
         return argv
@@ -214,6 +232,13 @@ def build_argv(name: str, args: dict) -> list[str]:
         if a.get("limit"):
             argv += ["--limit", str(a["limit"])]
         argv.append("--json")
+        return argv
+    if name == "msg_pending":
+        return ["msg", "pending", "--json"]
+    if name == "msg_reply":
+        argv = ["msg", "reply", a["id"], "--body", a["body"]]
+        if a.get("type"):
+            argv += ["--type", a["type"]]
         return argv
     if name == "msg_flush":
         return ["msg", "flush"]
