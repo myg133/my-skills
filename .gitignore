@@ -1,5 +1,6 @@
 # ── codewhale 运行时数据（每台机器本地特有）──
 .codewhale/
+.aw/
 workflow-runs.jsonl
 state/
 args
