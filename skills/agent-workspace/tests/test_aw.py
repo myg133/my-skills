@@ -111,6 +111,7 @@ class WorkspaceCase(unittest.TestCase):
             self.assertIn("msg_list", names)
             self.assertIn("doctor", names)
             self.assertIn("stats", names)
+            self.assertIn("schema", names)
             call = mcp_exchange(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                        "params": {"name": "agent_whoami", "arguments": {}}})
             payload = json.loads(call["result"]["content"][0]["text"])
@@ -119,6 +120,16 @@ class WorkspaceCase(unittest.TestCase):
             self.assertFalse(call["result"]["isError"])
         finally:
             self._stop_mcp(proc)
+
+    def test_schema_lists_tools(self):
+        out = run(["schema"], self.repo, agent=None)
+        data = json.loads(out.stdout)
+        self.assertIn("version", data)
+        names = {t["name"] for t in data["mcp_tools"]}
+        self.assertIn("claim_next", names)
+        self.assertIn("schema", names)
+        cli = {c["name"] for c in data["cli_only"]}
+        self.assertIn("watch", cli)
 
     def test_doctor_and_stats(self):
         clean = run(["doctor"], self.repo, agent=None)
@@ -529,6 +540,18 @@ class WorkspaceCase(unittest.TestCase):
         git(["push", "-q", "origin", "--all"], self.repo)
         return bare
 
+    def test_watch_wakes_only_new(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "fyi", "--body", "old"],
+            self.repo, agent="ba-1")
+        seed = run(["watch", "--once", "--json"], self.repo, agent=None)
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        self.assertEqual(seed.stdout.strip(), "")
+        run(["msg", "send", "--to", "ba-2", "--type", "question", "--body", "new"],
+            self.repo, agent="ba-1")
+        woke = run(["watch", "--once", "--json"], self.repo, agent=None)
+        self.assertIn('"agent": "ba-2"', woke.stdout)
+        self.assertIn('"type": "question"', woke.stdout)
+
     def test_next_req_sees_remote_demand(self):
         bare = self._with_remote()
         other = self.tmp / "other"
@@ -592,6 +615,64 @@ class WorkspaceCase(unittest.TestCase):
         mid = re.search(r"SENT(?:_LOCAL)? ([0-9a-f]+)", sent.stdout).group(1)
         show = json.loads(run(["msg", "show", mid], self.repo, agent="ba-1").stdout)
         self.assertEqual(show["expect"], "none")
+
+    def test_msg_doctor_and_lint_bad(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "fyi", "--body", "ok"],
+            self.repo, agent="ba-1")
+        tip = git(["rev-parse", "bus"], self.repo).stdout.strip()
+        bad = ("id: deadbeef\nfrom: x\nto: [y]\nat: 2026-10-29T00:00:00Z\n"
+               "type: status\n---\nbody")
+        sha = git(["commit-tree", "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                   "-p", tip, "-m", bad], self.repo).stdout.strip()
+        git(["update-ref", "refs/heads/bus", sha], self.repo)
+        doctor = run(["msg", "doctor"], self.repo, agent=None)
+        self.assertEqual(doctor.returncode, 1)
+        self.assertIn("invalid", doctor.stdout)
+        lint = run(["msg", "lint", "--rev", sha], self.repo, agent=None)
+        self.assertEqual(lint.returncode, 1)
+        self.assertIn("INVALID", lint.stdout)
+
+    def test_msg_flush_idempotent(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "fyi", "--body", "x"],
+            self.repo, agent="ba-1")
+        text = git(["log", "-1", "bus", "--format=%B"], self.repo).stdout
+        outbox = self.repo / ".aw" / "outbox"
+        outbox.mkdir(parents=True, exist_ok=True)
+        (outbox / "dup.md").write_text(text, encoding="utf-8")
+        out = run(["msg", "flush"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        count = git(["rev-list", "--count", "bus"], self.repo).stdout.strip()
+        self.assertEqual(count, "1")
+
+    def test_hook_install(self):
+        out = run(["hook", "install"], self.repo, agent=None)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        status = run(["hook", "status"], self.repo, agent=None)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        rel = git(["rev-parse", "--git-path", "hooks/pre-push"], self.repo).stdout.strip()
+        hook = Path(rel)
+        if not hook.is_absolute():
+            hook = self.repo / hook
+        self.assertTrue(hook.exists())
+
+    def test_msg_pending_groups_and_override(self):
+        run(["msg", "send", "--to", "ba-2", "--type", "fyi", "--expect", "ack",
+             "--body", "请确认"], self.repo, agent="ba-1")
+        run(["msg", "send", "--to", "ba-2", "--type", "question",
+             "--body", "怎么拆"], self.repo, agent="ba-1")
+        data = json.loads(run(["msg", "pending", "--json"], self.repo, agent="ba-2").stdout)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(data["groups"]["reply"], 1)
+        self.assertEqual(data["groups"]["ack"], 1)
+        fyi = next(m for m in data["messages"] if m["type"] == "fyi")
+        self.assertTrue(fyi["override"])
+        self.assertEqual(fyi["expect_default"], "none")
+
+    def test_msg_send_downgrade_warning(self):
+        out = run(["msg", "send", "--to", "ba-2", "--type", "handoff",
+                   "--expect", "ack", "--body", "交接"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("降级", out.stderr)
 
     def test_msg_body_too_large_hint(self):
         bad = run(["msg", "send", "--to", "all", "--body", "x" * 2001], self.repo, agent="ba-1")

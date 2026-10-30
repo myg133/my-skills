@@ -105,6 +105,40 @@ deadline: 2026-10-22T00:00:00Z
 - **发送方不要原地干等**：用 `msg_wait` 等 ≤120 秒，超时按 `default` 继续；
 - Planner 每天跑 `msg pending`，欠回复优先于新任务。
 
+#### ack 还是 reply
+
+| expect | 用于 | 典型类型 |
+|---|---|---|
+| `reply` | 对方需要**产出信息**：回答、方案、交接内容、裁决 | question / blocker / handoff |
+| `ack` | 对方只需要**确认收到**：知会、通知、单向下发 | fyi / contract-change |
+
+- 不要把 `reply` 当“收到请回复”用——那就是 `ack`；
+- 允许覆盖默认值，但**降级要在正文说明理由**（一句即可），尤其是 `handoff → ack`；
+- 反例：`fyi` 写“请回复确认”却用 `expect=reply`，会让对方写一段没必要的正文；
+- `msg send` 对 `question/blocker/handoff` 降级为 `ack/none` 时会在 stderr 提示，不阻断。
+
+`msg pending` 分两栏显示：
+
+```text
+需回复（reply）2 条
+需回执（ack）6 条
+```
+
+`--overdue` 不带值时按 `reply 2h / ack 24h` 过滤；带值则统一阈值。
+每行标注 `[覆盖默认: fyi 默认 none]`，一眼看出这是显式要求还是类型默认。
+
+#### 写入端校验（推荐）
+
+```bash
+aw.py hook install      # 写 .git/hooks/pre-push
+aw.py msg doctor        # 扫描历史：无头 / 缺 expect / 超长 / 绝对路径
+aw.py msg lint --rev <sha>
+```
+
+- pre-push 只校验 bus 提交，不干扰其它分支；
+- 可被 `git push --no-verify` 绕过，服务端仍需 CI / pre-receive 兜底；
+- `msg doctor` 出现即告警，不要等审计才发现。
+
 #### 强制门禁
 
 欠回复不是“建议”，会挡住下一步：
@@ -279,14 +313,16 @@ Notifier 的硬限制（只读、不回复、不 ack）见 `references/roles/not
 
 默认**不消费**（不推进已读）；需要消费时加 `consume:true`。
 
-CLI 无 MCP 时可退回轮询，但建议按状态分档（见下）：
+**空闲时不要让模型醒着。** 比 `msg_wait` 更省的是 watcher：
 
-| 状态 | 间隔 |
-|------|------|
-| 阻塞等 CI | 1 / 5 / 15 分钟 |
-| 有任务在手 | 15 分钟 |
-| 空闲 | 30 → 60 分钟退避 |
-| 等某个决定 | 2–3 分钟，最多 30 分钟 |
+```bash
+# 每台机器一个，只 fetch、不调模型；有新消息时拉起对应 agent
+aw.py watch --interval 5 --exec ./start-agent.sh
+```
+
+详见 `references/global/trigger.md`。
+
+只有在客户端不支持长工具调用时，才退回定时轮询；不要把它当默认。
 
 ## 12. 规模
 
