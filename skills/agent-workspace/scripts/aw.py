@@ -24,6 +24,8 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = SKILL_DIR / "assets" / "templates"
 ROOT_FILES = {".gitignore", "README.md"}
+FEATURE_META = "feature-meta"
+LEGACY_FEATURE_META = ".feature"
 
 OK, WARN, FAIL = "OK  ", "WARN", "FAIL"
 
@@ -240,14 +242,23 @@ def _check_naming(root: Path, report) -> None:
 
 def _check_feature_artifacts(root: Path, report) -> None:
     missing = []
+    legacy = []
     for e in worktrees(root):
         if not e["path"].name.startswith("feature-"):
             continue
-        if not (e["path"] / ".feature" / "manifest.json").exists():
+        meta = e["path"] / FEATURE_META / "manifest.json"
+        old = e["path"] / LEGACY_FEATURE_META / "manifest.json"
+        if meta.exists():
+            continue
+        if old.exists():
+            legacy.append(str(e["path"].relative_to(root)))
+        else:
             missing.append(str(e["path"].relative_to(root)))
+    if legacy:
+        report(WARN, "feature 产物", "旧 .feature（%s）；运行 aw.py upgrade 迁移" % ", ".join(legacy))
     if missing:
-        report(WARN, "feature 产物", "缺 .feature/manifest.json: %s" % ", ".join(missing))
-    else:
+        report(WARN, "feature 产物", "缺 %s/manifest.json: %s" % (FEATURE_META, ", ".join(missing)))
+    if not legacy and not missing:
         report(OK, "feature 产物", "无 feature worktree 或产物齐全")
 
 
@@ -1207,10 +1218,10 @@ def _write_manifest(root: Path, req: str, ident: dict) -> None:
         "created_at": _now(),
         "demand_dir": demand_rel,   # 仓库相对路径，跨机可读
     }
-    write_json(wt / ".feature" / "manifest.json", manifest)
+    write_json(wt / FEATURE_META / "manifest.json", manifest)
     # 把分配记录提交进 feature 分支：既是审计，也让工作区保持干净（便于回收）
     ident_args = ensure_identity(wt)
-    git(*ident_args, "add", ".feature/manifest.json", cwd=wt, check=False)
+    git(*ident_args, "add", "%s/manifest.json" % FEATURE_META, cwd=wt, check=False)
     git(*ident_args, "commit", "-q", "-m", "[BA] 分配 %s → %s" % (req, ident["agent_id"]),
         cwd=wt, check=False)
 
@@ -2852,6 +2863,97 @@ def cmd_schema(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- onboard
+
+def cmd_onboard(args) -> int:
+    data: dict = {"initialized": False, "questions": [], "next": []}
+    try:
+        root = repo_root()
+        aw_init(root)
+        branch = branch_of(root)
+    except (GitError, IdentityError):
+        data["questions"] = [
+            "这是新项目（init）还是已有仓库（migrate）？",
+            "本地模式还是远程模式（有 origin）？",
+        ]
+        data["next"] = ["aw.py init <dir> --name ... [--remote ...]", "或 aw.py migrate --main <branch>"]
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            print("状态: 不是 workspace 仓库")
+            for q in data["questions"]:
+                print("  问用户: " + q)
+        return 0
+
+    files = sorted(p for p in git("ls-files", cwd=root, check=False).stdout.splitlines() if p)
+    remote = git("remote", "get-url", "origin", cwd=root, check=False).stdout.strip()
+    roster = load_roster(root)
+    active = [a for a in roster if a.get("status", "active") == "active"]
+    planners = [a for a in active if a.get("role") == "planner"]
+    hook_path = _pre_push_path(root)
+    hook_ok = hook_path.exists() and HOOK_MARKER in hook_path.read_text(
+        encoding="utf-8", errors="replace")
+    queue = load_queue(root)
+    ident = (os.environ.get("AW_AGENT_ID") or "").strip()
+
+    mode = "remote" if remote else "local"
+    team = "team" if planners else "solo"
+    questions = []
+    if not remote:
+        questions.append("本地模式（不 push、不跨机）还是补一个 origin？")
+    if not roster:
+        questions.append("BA 叫什么名字？单人 solo 还是 Planner + 多 BA？")
+    elif not planners and len(active) > 1:
+        questions.append("已有多个 BA 但没有 Planner：指定一个 Planner，还是保持 solo？")
+    if not ident:
+        questions.append("本终端用哪个 agent_id？（如 pcA-ba-1）")
+    if not hook_ok:
+        questions.append("是否安装 pre-push 校验？（aw.py hook install）")
+
+    data.update({
+        "initialized": True,
+        "root": str(root),
+        "branch": branch,
+        "mode": mode,
+        "remote": remote,
+        "team": team,
+        "identity": ident,
+        "roster": {"total": len(roster), "active": len(active),
+                   "planner": planners[0]["id"] if planners else None},
+        "hook": hook_ok,
+        "queue": len(queue),
+        "questions": questions,
+        "next": [],
+    })
+    if not ident:
+        data["next"].append("aw.py agent register <name> --role ba（solo 可直接 active）")
+    if not hook_ok:
+        data["next"].append("aw.py hook install")
+    data["next"].append("aw.py doctor")
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print("Agent Workspace 接入检查")
+        print("  repo   : %s (%s)" % (root, branch))
+        print("  mode   : %s%s" % (mode, ("  origin=" + remote) if remote else ""))
+        print("  team   : %s%s" % (team, ("  planner=" + data["roster"]["planner"])
+                                   if planners else ""))
+        print("  identity: %s" % (ident or "MISSING"))
+        print("  roster : %d active / %d total" % (len(active), len(roster)))
+        print("  hook   : %s" % ("OK" if hook_ok else "MISSING"))
+        print("  queue  : %d" % len(queue))
+        if questions:
+            print("\n需要问用户：")
+            for q in questions:
+                print("  - " + q)
+        if data["next"]:
+            print("\n下一步：")
+            for n in data["next"]:
+                print("  " + n)
+    return 0
+
+
 # ---------------------------------------------------------------- mcp setup
 
 MCP_SERVER = Path(__file__).resolve().parent / "aw_mcp.py"
@@ -3041,7 +3143,9 @@ def load_feature_pins(root: Path) -> list[dict]:
     for e in worktrees(root):
         if not e["path"].name.startswith("feature-") or not e["path"].exists():
             continue
-        manifest = e["path"] / ".feature" / "manifest.json"
+        manifest = e["path"] / FEATURE_META / "manifest.json"
+        if not manifest.exists():
+            manifest = e["path"] / LEGACY_FEATURE_META / "manifest.json"
         data = read_json(manifest, {}) if manifest.exists() else {}
         pins = data.get("contracts") or {}
         features.append({
@@ -3234,10 +3338,19 @@ def cmd_upgrade(args) -> int:
 
     # 4. feature 产物
     for e in wt:
-        if e["path"].name.startswith("feature-") and not (e["path"] / ".feature" / "manifest.json").exists():
-            add.append(("%s/.feature/manifest.json" % e["path"].name,
+        if not e["path"].name.startswith("feature-"):
+            continue
+        meta = e["path"] / FEATURE_META / "manifest.json"
+        old = e["path"] / LEGACY_FEATURE_META / "manifest.json"
+        if meta.exists():
+            continue
+        if old.exists():
+            adjust.append(("%s/%s" % (e["path"].name, LEGACY_FEATURE_META),
+                           "旧隐藏目录 .feature", "git mv .feature %s 并提交" % FEATURE_META))
+        else:
+            add.append(("%s/%s/manifest.json" % (e["path"].name, FEATURE_META),
                         "缺少分配记录",
-                        "启用 .feature 规范时补 manifest（agent_id / base_commit）"))
+                        "补 manifest（agent_id / base_commit）"))
 
     # 5. 僵尸 worktree
     for e in wt:
@@ -3377,6 +3490,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="一页巡检：workspace/拓扑/认领/队列/契约")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_onboard = sub.add_parser("onboard", help="首次接入检查：模式 / 身份 / 名册 / hook / 待问问题")
+    p_onboard.add_argument("--json", action="store_true")
+    p_onboard.set_defaults(func=cmd_onboard)
 
     p_schema = sub.add_parser("schema", help="输出工具清单（JSON）：MCP 工具 + 仅 CLI 命令")
     p_schema.set_defaults(func=cmd_schema)
