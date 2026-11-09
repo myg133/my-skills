@@ -97,7 +97,7 @@ agent 接手新项目时, 从根 `.dir-tree.md` 开始, 按链接向下钻, 几�
 
 ## 2. 工具链 (3 个 Python 脚本)
 
-3 个脚本在 `scripts/` 下, 都是**幂等** + **支持 `--apply` / `--dry-run`**:
+3 个脚本在 `scripts/` 下, 都是**幂等**的; `gen` / `cleanup` 默认 dry-run, 加 `--apply` 才落盘.
 
 ### 2.1 `gen_dir_tree.py` — 生成 / 刷新自动段
 
@@ -108,7 +108,7 @@ python scripts/gen_dir_tree.py <dir1> [dir2 ...]
 # 真正写文件
 python scripts/gen_dir_tree.py --apply <dir1> [dir2 ...]
 
-# 跑预设目标清单 (--all, 适合大项目, 一次性全更新)
+# 刷新 cwd 下所有已有 .dir-tree.md
 python scripts/gen_dir_tree.py --all
 python scripts/gen_dir_tree.py --apply --all
 ```
@@ -122,20 +122,23 @@ python scripts/gen_dir_tree.py --apply --all
 - 文件: 标 `(<size>)` 格式 (`B` / `KB` / `MB`)
 - **保留手动段**, 只覆盖 `<!-- AUTO:START -->` 到 `<!-- AUTO:END -->` 之间的内容
 
-**自定义目标清单**: 改 `DEFAULT_TARGETS` 列表 (脚本第 34 行附近), 加新路径.
+`--all` 从 cwd 递归发现已有 `.dir-tree.md`, 不依赖任何硬编码目录清单; 初次引入请显式传目录名.
 
 ### 2.2 `cleanup_handwritten_tree.py` — 清理手写段里的 ASCII 树
 
 ```bash
-# dry-run
+# dry-run (默认扫 cwd 下所有 .dir-tree.md)
 python scripts/cleanup_handwritten_tree.py
+
+# 只扫指定目录
+python scripts/cleanup_handwritten_tree.py <dir1> [dir2 ...]
 
 # 真正改
 python scripts/cleanup_handwritten_tree.py --apply
 ```
 
 **行为**:
-- 扫预设目标清单的 19+ 个 `.dir-tree.md`
+- 默认从 cwd 递归发现所有 `.dir-tree.md`, 也可显式传目录或文件
 - 找 "## 结构" / "## 顶层结构" 等 H2 标题 + 紧跟的 ```text``` 块
 - 整段删掉 (因为自动段会接管)
 - 保留其他手写段 (跳到上层 / 何时读 / 维护原则等)
@@ -174,7 +177,7 @@ python scripts/verify_dir_tree.py --strict
 
 ### 3.2 改了目录结构, 刷新索引
 
-1. 跑 `gen_dir_tree.py --apply --all` (如果项目已配 `DEFAULT_TARGETS`)
+1. 跑 `gen_dir_tree.py --apply --all` (刷新全部已有索引)
 2. 跑 `verify_dir_tree.py` 检查
 3. 检查 manual 段是否要更新 (新子目录 / 新红线)
 
@@ -212,15 +215,15 @@ python scripts/verify_dir_tree.py --strict
 3. **跳图链接用相对路径**: 跨平台, 可重定位, verify 能检查
 4. **git 仓不深入**: 标 `(git 仓)` 让 agent 自己点开仓内 `AGENTS.md`
 5. **幂等 + --apply/--dry-run**: 多次跑结果一样, 跑前可预览
-6. **DEFAULT_TARGETS 在脚本里**: 不靠 agent 记忆目标清单, 改一次覆盖全部
+6. **目标靠发现, 不靠硬编码清单**: `--all` 扫描已有 `.dir-tree.md`, 换项目无需改脚本
 7. **不强制每个目录都有**: 没有 `.dir-tree.md` 的子目录标 `(无组织图)`, 渐进引入
 
 ## 6. 自定义与扩展
 
-### 6.1 改默认目标清单
+### 6.1 目标发现规则
 
-每个脚本都有 `DEFAULT_TARGETS` 列表 (在文件顶部), 改成自己项目的目录结构.
-**3 个脚本的列表要保持一致** (或至少 `gen_dir_tree.py` 是子集).
+三个脚本默认从 cwd 递归发现 `.dir-tree.md` (跳过 `SKIP_DIRS`), 不需要维护目标清单.
+想限定范围时显式传目录或文件.
 
 ### 6.2 改跳过列表
 

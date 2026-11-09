@@ -1,5 +1,5 @@
 """
-清理 19 个 .dir-tree.md 手写段里的 ASCII 树段 (一次性).
+清理 .dir-tree.md 手写段里的 ASCII 树段.
 
 策略:
 - 找 "## 结构" 段 (H2 heading) + 紧跟的第一个 ```text``` 块, 整段删掉
@@ -7,37 +7,27 @@
 - 跑完再跑 gen_dir_tree.py --apply, 自动段会接管
 
 用法:
-  python cleanup_handwritten_tree.py --dry-run          # 输出预览, 不改文件
-  python cleanup_handwritten_tree.py --apply            # 真正改文件
-
-目标目录: 项目根下 19 个 .dir-tree.md
+  python cleanup_handwritten_tree.py                 # dry-run, 扫 cwd 下所有 .dir-tree.md
+  python cleanup_handwritten_tree.py <dir> [...]     # dry-run, 只扫指定目录
+  python cleanup_handwritten_tree.py --apply         # 真正改文件
 """
 from pathlib import Path
+import argparse
 import re
-import sys
 
-# 跟 gen_dir_tree.py 的 DEFAULT_TARGETS 保持一致
-DEFAULT_TARGETS = [
-    ".",
-    "codes",
-    "docs",
-    "scratchpad",
-    "reports_dashboard",
-    "docs/00-overview",
-    "docs/01-team",
-    "docs/02-operations",
-    "docs/02-operations/bi",
-    "docs/02-operations/bi/00-meta",
-    "docs/02-operations/bi/01-ods-public",
-    "docs/02-operations/bi/02-design",
-    "docs/02-operations/bi/99-decisions",
-    "docs/02-operations/bi/Scripts",
-    "docs/03-delivery",
-    "docs/04-growth",
-    "docs/05-governance",
-    "docs/prompts",
-    "docs/templates",
-]
+SKIP_DIRS = {
+    ".git", "__pycache__", ".venv", "node_modules", "target", "dist",
+    ".minimax", ".aionrs", ".idea", ".vscode", ".mypy_cache",
+}
+
+
+def discover_targets(root: Path) -> list[Path]:
+    """cwd 下所有已有 .dir-tree.md 的目录 (跳过 SKIP_DIRS)."""
+    return sorted(
+        p.parent.resolve()
+        for p in root.rglob(".dir-tree.md")
+        if not any(part in SKIP_DIRS for part in p.parts)
+    )
 
 
 def cleanup_text(text: str) -> tuple[str, bool]:
@@ -78,27 +68,39 @@ def cleanup_text(text: str) -> tuple[str, bool]:
 
 
 def main():
-    dry_run = "--apply" not in sys.argv
+    p = argparse.ArgumentParser(description="清理 .dir-tree.md 手写段里的 ASCII 树")
+    p.add_argument("paths", nargs="*", help="要清理的目录或 .dir-tree.md 文件 (默认 cwd 下全部)")
+    p.add_argument("--apply", action="store_true", help="真正改文件 (默认 dry-run)")
+    p.add_argument("--dry-run", action="store_true", help="只输出预览 (默认)")
+    args = p.parse_args()
+
+    dry_run = not args.apply
     root = Path.cwd()
-    targets = [root / t for t in DEFAULT_TARGETS]
+    if args.paths:
+        targets = [Path(t).resolve() for t in args.paths]
+    else:
+        targets = discover_targets(root)
+        if not targets:
+            print("cwd 下没有 .dir-tree.md")
+            return
 
     changed_count = 0
     for t in targets:
-        target_file = t / ".dir-tree.md"
+        target_file = t if t.is_file() else t / ".dir-tree.md"
+        rel = target_file.relative_to(root) if target_file.is_relative_to(root) else target_file
         if not target_file.exists():
-            print(f"[SKIP] 不存在: {target_file.relative_to(root)}")
+            print(f"[SKIP] 不存在: {rel}")
             continue
 
         text = target_file.read_text(encoding="utf-8")
         new_text, changed = cleanup_text(text)
 
         if not changed:
-            print(f"[NOOP] 没找到 '## 结构' 段: {target_file.relative_to(root)}")
+            print(f"[NOOP] 没找到 '## 结构' 段: {rel}")
             continue
 
         if dry_run:
-            print(f"=== DRY-RUN: {target_file.relative_to(root)} ===")
-            # 输出前 30 行对比
+            print(f"=== DRY-RUN: {rel} ===")
             old_preview = "\n".join(text.split("\n")[:30])
             new_preview = "\n".join(new_text.split("\n")[:30])
             print("--- OLD (前 30 行) ---")
@@ -109,7 +111,7 @@ def main():
         else:
             target_file.write_text(new_text, encoding="utf-8")
             changed_count += 1
-            print(f"[WROTE] {target_file.relative_to(root)}")
+            print(f"[WROTE] {rel}")
 
     print()
     mode = "DRY-RUN" if dry_run else "APPLY"

@@ -7,40 +7,27 @@
 3. 跳图链接格式: 只允许相对路径, 不允许 http:// 或绝对路径
 
 用法:
-  python verify_dir_tree.py              # 扫 DEFAULT_TARGETS 全部
-  python verify_dir_tree.py <path>...    # 扫指定文件
+  python verify_dir_tree.py              # 扫 cwd 下所有 .dir-tree.md
+  python verify_dir_tree.py <path>...    # 扫指定目录或文件
   python verify_dir_tree.py --strict     # 警告也算错误
 """
 from pathlib import Path
 import re
 import sys
 
-# 跟 gen_dir_tree.py 一致
-DEFAULT_TARGETS = [
-    ".",
-    "codes",
-    "docs",
-    "scratchpad",
-    "reports_dashboard",
-    "_tools",
-    "docs/00-overview",
-    "docs/01-team",
-    "docs/02-operations",
-    "docs/02-operations/bi",
-    "docs/02-operations/bi/00-meta",
-    "docs/02-operations/bi/01-ods-public",
-    "docs/02-operations/bi/02-design",
-    "docs/02-operations/bi/02-design/dashboard-html",
-    "docs/02-operations/bi/_archive",
-    "docs/02-operations/bi/_archive/migration-20260721",
-    "docs/02-operations/bi/99-decisions",
-    "docs/02-operations/bi/Scripts",
-    "docs/03-delivery",
-    "docs/04-growth",
-    "docs/05-governance",
-    "docs/prompts",
-    "docs/templates",
-]
+SKIP_DIRS = {
+    ".git", "__pycache__", ".venv", "node_modules", "target", "dist",
+    ".minimax", ".aionrs", ".idea", ".vscode", ".mypy_cache",
+}
+
+
+def discover_files(root: Path) -> list[Path]:
+    """cwd 下所有 .dir-tree.md (跳过 SKIP_DIRS)."""
+    return sorted(
+        p.resolve()
+        for p in root.rglob(".dir-tree.md")
+        if not any(part in SKIP_DIRS for part in p.parts)
+    )
 
 AUTO_START = "<!-- AUTO:START -->"
 AUTO_END = "<!-- AUTO:END -->"
@@ -94,27 +81,30 @@ def check_file(path: Path) -> list[str]:
 def main():
     strict = "--strict" in sys.argv
     paths = [p for p in sys.argv[1:] if not p.startswith("--")]
-
+    root = Path.cwd()
     if paths:
-        targets = [Path(p) / ".dir-tree.md" for p in paths]
+        targets = []
+        for p in paths:
+            path = Path(p).resolve()
+            targets.append(path if path.is_file() else path / ".dir-tree.md")
     else:
-        root = Path.cwd()
-        targets = [root / t / ".dir-tree.md" for t in DEFAULT_TARGETS]
+        targets = discover_files(root)
+        if not targets:
+            print("cwd 下没有 .dir-tree.md")
+            return
 
     total = 0
     failed = 0
-    warning_count = 0
     for t in targets:
         errors = check_file(t)
         total += 1
+        rel = t.relative_to(root) if t.is_relative_to(root) else t
         if errors:
             failed += 1
-            rel = t.relative_to(Path.cwd()) if t.is_absolute() and t.exists() else t
             print(f"❌ {rel}")
             for e in errors:
                 print(f"   {e}")
         else:
-            rel = t.relative_to(Path.cwd()) if t.is_absolute() and t.exists() else t
             print(f"✓ {rel}")
 
     print()

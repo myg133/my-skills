@@ -1,14 +1,4 @@
----
-name: zread-wiki
-description: >-
-  Use when the project has a .zread/wiki directory. Leverage zread-generated
-  documentation as the primary knowledge layer for code understanding,
-  architecture analysis, change impact assessment, and feature→file mapping.
-  Works across any project — not bound to a specific codebase.
-invocation: model+user
----
-
-# Zread Wiki
+# Wiki consumption workflow
 
 > 基于 zread 生成的 `.zread/wiki` 文档，为 agent 提供代码理解的知识增强层。
 > 跨项目通用，零配置，纯指令驱动。
@@ -33,9 +23,9 @@ invocation: model+user
 
 ```
 1. 检查 .zread/wiki/versions/ 是否存在
-2. 如果存在，找到最新版本目录：
-   - 按时间戳排序（目录名格式：YYYY-MM-DD-HHmmss）
-   - 取最大值为最新版本
+2. 确定当前版本：
+   - 优先读 .zread/wiki/current（纯文本文件，内容是版本 id，如 2026-03-12-010203）
+   - current 缺失时，按目录名时间戳取 versions/ 下最大者
 3. 读取该目录下的 wiki.json，建立页面索引
 4. 将索引摘要纳入工作记忆：
    - 总页数、section 分布、group 分组
@@ -126,10 +116,9 @@ invocation: model+user
 
 ## Version Awareness
 
-- 始终使用 `versions/` 下时间戳最大的版本
-- 如果 zread 重新生成（新版本目录出现），下次检查时自动切换到新版本
+- 始终使用 `.zread/wiki/current` 指向的版本；current 缺失时取 `versions/` 下时间戳最大的目录
+- 如果 zread 重新生成（新版本目录出现，current 更新），下次检查时自动切换到新版本
 - 旧版本保留在 `versions/` 中，必要时可以回溯对比
-- `current/` 目录如果存在符号链接，可直接使用；否则按时间戳定位
 
 ## Safety Notes
 

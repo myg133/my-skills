@@ -10,10 +10,11 @@
 用法:
   python gen_dir_tree.py <dir1> [dir2 ...]                # dry-run, 输出到控制台
   python gen_dir_tree.py --apply <dir1> [dir2 ...]       # 真正写文件
-  python gen_dir_tree.py --all                           # 跑 19 个 .dir-tree.md
+  python gen_dir_tree.py --all                           # 刷新 cwd 下所有已有 .dir-tree.md
+  python gen_dir_tree.py --apply --all                   # 同上, 真正写文件
 
 约定:
-- 跟项目根非 git 目录一一对应 (codes/ docs/ scratchpad/ reports_dashboard/ 等)
+- 目标目录 = 已经存在 .dir-tree.md 的目录; 初次引入请显式传目录名
 - 不在 git 仓内部写, 避免污染 (遇到 .git 目录只标 "(git 仓)", 不深入)
 """
 from pathlib import Path
@@ -30,31 +31,14 @@ SKIP_DIRS = {
 AUTO_START = "<!-- AUTO:START -->"
 AUTO_END = "<!-- AUTO:END -->"
 
-# 项目根下的"目标目录"清单 (--all 跑这些)
-DEFAULT_TARGETS = [
-    ".",
-    "codes",
-    "docs",
-    "scratchpad",
-    "reports_dashboard",
-    "docs/00-overview",
-    "docs/01-team",
-    "docs/02-operations",
-    "docs/02-operations/bi",
-    "docs/02-operations/bi/00-meta",
-    "docs/02-operations/bi/01-ods-public",
-    "docs/02-operations/bi/02-design",
-    "docs/02-operations/bi/02-design/dashboard-html",
-    "docs/02-operations/bi/_archive",
-    "docs/02-operations/bi/_archive/migration-20260721",
-    "docs/02-operations/bi/99-decisions",
-    "docs/02-operations/bi/Scripts",
-    "docs/03-delivery",
-    "docs/04-growth",
-    "docs/05-governance",
-    "docs/prompts",
-    "docs/templates",
-]
+
+def discover_targets(root: Path) -> list[Path]:
+    """cwd 下所有已有 .dir-tree.md 的目录 (跳过 SKIP_DIRS)."""
+    return sorted(
+        p.parent.resolve()
+        for p in root.rglob(".dir-tree.md")
+        if not any(part in SKIP_DIRS for part in p.parts)
+    )
 
 
 def is_git_root(path: Path) -> bool:
@@ -167,12 +151,14 @@ def main():
     p = argparse.ArgumentParser(description=".dir-tree.md 自动生成器")
     p.add_argument("paths", nargs="*", help="要生成 .dir-tree.md 的目录")
     p.add_argument("--apply", action="store_true", help="真正写文件 (默认 dry-run)")
-    p.add_argument("--all", action="store_true", help="跑 DEFAULT_TARGETS (项目根下 19 个 .dir-tree.md)")
+    p.add_argument("--all", action="store_true", help="刷新 cwd 下所有已有 .dir-tree.md")
     args = p.parse_args()
 
     if args.all:
-        root = Path.cwd()
-        targets = [root / t for t in DEFAULT_TARGETS]
+        targets = discover_targets(Path.cwd())
+        if not targets:
+            print("cwd 下没有 .dir-tree.md; 初次引入请显式传目录名")
+            return
     elif args.paths:
         targets = [Path(p).resolve() for p in args.paths]
     else:

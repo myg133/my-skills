@@ -53,6 +53,9 @@ invoked from another program/agent.
 1. **User wants to read existing wiki content?**
    - Check `./.zread/wiki/current`. If present, read `wiki.json` and the page
      markdown directly. No CLI invocation needed.
+   - For the full consumption workflow (page discovery, context matching,
+     feature→file mapping, version awareness), read
+     [references/wiki-consumption.md](./references/wiki-consumption.md).
    - For known *public* GitHub repos, prefer the `mcp__zread__*` tools
      (`get_repo_structure`, `read_file`, `search_doc`) over running the CLI.
 
@@ -98,6 +101,9 @@ invoked from another program/agent.
 
 ## Reference files
 
+- [references/wiki-consumption.md](./references/wiki-consumption.md) — how to
+  use an existing wiki as a knowledge layer: index discovery, context
+  matching, feature→file mapping, version awareness.
 - [references/stdio-protocol.md](./references/stdio-protocol.md) — JSON-line
   wire protocol shared by every command's `--stdio` mode. Load when
   programmatically driving zread.
