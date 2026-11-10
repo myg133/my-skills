@@ -50,9 +50,10 @@ aw.py watch --interval 5 --exec /path/to/start-agent.sh
 行为：
 
 - 首次启动会 **seed**，跳过历史消息，不重放；
-- 状态在 `.aw/watch-state.json`；
+- 状态在 `.aw/watch-state.json`（pid / 心跳 / wake_dir）；
 - 单机文件锁，重复启动输出 `WATCH_RUNNING`；
-- 只 `git fetch`，不调用模型。
+- 只 `git fetch`，不调用模型；
+- `--wake-dir .aw/wake` 会把每个 agent 的唤醒事件写成 `.aw/wake/<agent>.json`，供 MCP 转通知。
 
 ### 2.1 一台 PC 多个 agent
 
@@ -79,6 +80,74 @@ AW_AGENT_ID=pcA-ba-1 aw.py msg watch --once --json   # 有消息 exit 0，没有
 `msg watch` 是 per agent 的**收件箱监听**（只看发给自己的消息）。
 同一台机器上用了 `aw.py watch` 就不必再让每个 agent 各起一个 `msg watch`，
 否则同一条消息会触发两次。
+
+### 2.2 谁启动 watcher
+
+两种都成立：
+
+| 方式 | 适用 | 说明 |
+|------|------|------|
+| **首个 agent 执行 `watch --ensure`** | 没有 supervisor 的普通开发机 | 幂等；后台起独立进程后立刻返回 |
+| supervisor / systemd / launchd / 计划任务 | 长期运行、容器、无人值守 | 更可控，能配重启策略 |
+
+**不要由 agent 进程自己跑循环**（`watch` 前台阻塞），而是调用 `--ensure`：
+
+```bash
+aw.py watch --ensure --interval 5 --wake-dir .aw/wake
+# WATCH_STARTED pid=34160 wake_dir=.../.aw/wake   ← 首次
+# WATCH_RUNNING pid=34160                          ← 后续 agent 调用
+```
+
+语义：
+
+- `--ensure` 检查状态；没有 RUNNING 就 **detach 一个子进程**（POSIX `setsid` / Windows `DETACHED_PROCESS`），然后返回；
+- watcher 不依附于当前 agent 会话，agent 退出后继续监听；
+- 多个 agent 同时 ensure：文件锁保证只有一个成为 watcher，其余得到 `WATCH_RUNNING`；
+- 机器重启 / watcher 被杀后，下一个 agent 再 `--ensure` 即可恢复；
+- 日志在 `.aw/watch.log`，状态用 `--status` 查。
+
+边界：
+
+- 容器或强沙箱可能不允许 detach 子进程，这时必须用 supervisor；
+- `--ensure` 只负责“起”，不负责“守护”；要自动重启还是 systemd / 计划任务；
+- 停止用 `aw.py watch --stop`。
+
+原则：**一台机器、一个仓库、一个 watcher**。
+
+检查：
+
+```bash
+aw.py watch --status          # RUNNING / STALE / STOPPED / UNKNOWN
+aw.py watch --status --json
+aw.py doctor                  # watcher 一行
+```
+
+状态来自 `.aw/watch-state.json`：
+
+| 状态 | 含义 | 处理 |
+|------|------|------|
+| `RUNNING` | pid 存活且心跳新鲜 | 正常 |
+| `STALE` | pid 还在，但超过 `max(60s, 6×interval)` 没心跳 | 可能卡在 fetch/锁；看日志后重启 |
+| `STOPPED` | pid 不存在 | 重新启动 |
+| `UNKNOWN` | 从未启动过 | 启动一次 |
+
+重复启动会被文件锁挡住，输出 `WATCH_RUNNING`，不会出现两个 watcher。
+
+单独检查也可以：
+
+```bash
+aw.py watch --ensure --json   # 需要时起，已在跑则 WATCH_RUNNING
+aw.py watch --status --json   # 只读
+aw.py watch --stop            # 停掉本机 watcher
+```
+
+### 2.3 与 MCP 通知的关系
+
+watcher 只写 `.aw/wake/<agent>.json`；MCP 进程读这个文件、发 notification。
+这样 fetch 仍然只有一份，MCP 不联网、不碰 git。
+
+如果 MCP 没有启动，wake 文件仍在，只是没人发通知——消息本身还在 bus 上，
+`msg_inbox` / `msg_wait` 仍然能取到。
 
 ## 3. supervisor 脚本
 

@@ -2774,6 +2774,47 @@ def _fmt_age(seconds: float | None) -> str:
     return "%dd" % int(seconds // 86400)
 
 
+def _watch_status_data(root: Path) -> dict:
+    state = read_json(aw_path(root, "watch-state.json"), {})
+    if not state:
+        return {"status": "UNKNOWN", "pid": 0, "age_seconds": None,
+                "interval": 0, "wake_dir": "", "seen": 0}
+    pid = int(state.get("pid") or 0)
+    interval = float(state.get("interval") or 5)
+    last = state.get("last_fetch") or state.get("updated_at") or state.get("seeded_at")
+    age = _age_seconds(last) if last else None
+    alive = bool(pid and pid_alive(pid))
+    if alive and (age is None or age <= max(60.0, interval * 6)):
+        status = "RUNNING"
+    elif alive:
+        status = "STALE"
+    else:
+        status = "STOPPED"
+    return {
+        "status": status,
+        "pid": pid,
+        "age_seconds": round(age, 1) if age is not None else None,
+        "interval": interval,
+        "wake_dir": state.get("wake_dir") or "",
+        "seen": len(state.get("seen") or []),
+        "last_wake": state.get("last_wake") or "",
+    }
+
+
+def _watch_status(root: Path, as_json: bool) -> int:
+    data = _watch_status_data(root)
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print("watcher: %s" % data["status"])
+        print("  pid      : %s" % (data["pid"] or "-"))
+        print("  heartbeat: %s" % _fmt_age(data["age_seconds"]))
+        print("  interval : %ss" % data["interval"])
+        print("  wake_dir : %s" % (data["wake_dir"] or "-"))
+        print("  seen     : %d" % data["seen"])
+    return 0 if data["status"] == "RUNNING" else 3
+
+
 def cmd_doctor(args) -> int:
     root = repo_root()
     aw_init(root)
@@ -2797,6 +2838,15 @@ def cmd_doctor(args) -> int:
     except (GitError, OSError):
         rows.append((WARN, "hook", "无法检查"))
         warns.append("hook")
+
+    watcher = _watch_status_data(root)
+    if watcher["status"] == "RUNNING":
+        rows.append((OK, "watcher", "pid %s，心跳 %s" % (
+            watcher["pid"], _fmt_age(watcher["age_seconds"]))))
+    else:
+        rows.append((WARN, "watcher", "%s；首个 agent 可 aw.py watch --ensure，或用 supervisor"
+                     % watcher["status"]))
+        warns.append("watcher")
 
     trees = worktrees(root)
     nested = [e["path"].name for e in trees if e["path"] != root and e["path"].exists()
@@ -2998,10 +3048,80 @@ def _wake_targets(message: dict, roster: list[dict]) -> list[str]:
     return sorted(targets)
 
 
+def _stop_watch(root: Path) -> int:
+    state = _watch_status_data(root)
+    pid = state.get("pid") or 0
+    if not pid or not pid_alive(pid):
+        print("WATCH_STOPPED 当前没有运行中的 watcher")
+        return 0
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True, text=True, check=False)
+    else:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    for _ in range(20):
+        time.sleep(0.2)
+        if _watch_status_data(root)["status"] != "RUNNING":
+            print("WATCH_STOPPED pid=%s" % pid)
+            return 0
+    print("WATCH_STOP_FAILED pid=%s" % pid, file=sys.stderr)
+    return 3
+
+
+def _ensure_watch(root: Path, args) -> int:
+    state = _watch_status_data(root)
+    if state["status"] == "RUNNING":
+        print("WATCH_RUNNING pid=%s" % state["pid"])
+        return 0
+
+    wake = args.wake_dir or ".aw/wake"
+    cmd = [sys.executable, str(Path(__file__).resolve()), "watch",
+           "--interval", str(args.interval), "--wake-dir", wake]
+    if args.no_fetch:
+        cmd.append("--no-fetch")
+    if args.exec:
+        cmd += ["--exec", args.exec]
+
+    log = aw_path(root, "watch.log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as handle:
+        kwargs: dict = {"cwd": str(root), "stdin": subprocess.DEVNULL,
+                        "stdout": handle, "stderr": handle}
+        if os.name == "nt":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            kwargs["creationflags"] = flags
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+
+    for _ in range(20):
+        time.sleep(0.25)
+        state = _watch_status_data(root)
+        if state["status"] == "RUNNING":
+            if args.json:
+                print(json.dumps({"status": "STARTED", "pid": state["pid"],
+                                  "wake_dir": state["wake_dir"]}, ensure_ascii=False))
+            else:
+                print("WATCH_STARTED pid=%s wake_dir=%s" % (state["pid"], state["wake_dir"]))
+            return 0
+    print("WATCH_START_FAILED 见 %s" % log, file=sys.stderr)
+    return 3
+
+
 def cmd_watch(args) -> int:
     root = repo_root()
     aw_init(root)
     state_path = aw_path(root, "watch-state.json")
+    if getattr(args, "status", False):
+        return _watch_status(root, bool(args.json))
+    if getattr(args, "stop", False):
+        return _stop_watch(root)
+    if getattr(args, "ensure", False):
+        return _ensure_watch(root, args)
     lock = FileLock(aw_path(root, "locks", "watch.lock"), timeout=0.5)
     try:
         with lock:
@@ -3019,8 +3139,24 @@ def _watch_loop(root: Path, state_path: Path, args) -> int:
     messages = load_bus_messages(root, fetch=not args.no_fetch)
     if first:
         seen = {m.get("id") for m in messages if m.get("id")}
-        write_json(state_path, {"seen": sorted(seen)[-5000:], "seeded_at": _now()})
+        state["seeded_at"] = _now()
         print("WATCH_READY 已初始化，跳过 %d 条历史消息" % len(seen), file=sys.stderr)
+
+    wake_dir = None
+    if getattr(args, "wake_dir", ""):
+        wake_dir = Path(args.wake_dir)
+        if not wake_dir.is_absolute():
+            wake_dir = root / wake_dir
+        wake_dir.mkdir(parents=True, exist_ok=True)
+
+    state.update({
+        "pid": os.getpid(),
+        "started_at": state.get("started_at") or _now(),
+        "interval": args.interval,
+        "wake_dir": str(wake_dir or ""),
+        "last_fetch": _now(),
+    })
+    write_json(state_path, state)
 
     children: list[subprocess.Popen] = []
     while True:
@@ -3030,6 +3166,7 @@ def _watch_loop(root: Path, state_path: Path, args) -> int:
         messages = load_bus_messages(root, fetch=False)
         roster = load_roster(root)
         new = [m for m in messages if m.get("id") and m["id"] not in seen]
+        wake_batch: dict[str, list[dict]] = {}
         for m in new:
             for agent in _wake_targets(m, roster):
                 payload = {
@@ -3043,6 +3180,8 @@ def _watch_loop(root: Path, state_path: Path, args) -> int:
                     print("WAKE %s %s %s %s" % (
                         agent, m.get("id"), m.get("type"), (m.get("subject") or "")[:60]),
                         flush=True)
+                if wake_dir and agent != "*":
+                    wake_batch.setdefault(agent, []).append(payload)
                 if args.exec:
                     env = dict(os.environ)
                     env.update({
@@ -3062,9 +3201,20 @@ def _watch_loop(root: Path, state_path: Path, args) -> int:
                             args.exec, shell=True, env=env, cwd=str(root),
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True))
+
+        for agent, items in wake_batch.items():
+            path = wake_dir / ("%s.json" % agent)
+            existing = read_json(path, {})
+            msgs = (existing.get("messages") or []) + items
+            write_json(path, {"agent": agent, "updated_at": _now(), "messages": msgs[-20:]})
+        if wake_batch:
+            state["last_wake"] = _now()
+
         if new:
             seen |= {m["id"] for m in new if m.get("id")}
-            write_json(state_path, {"seen": sorted(seen)[-5000:], "updated_at": _now()})
+            state["seen"] = sorted(seen)[-5000:]
+        state["last_fetch"] = _now()
+        write_json(state_path, state)
         if args.once:
             return 0
         time.sleep(max(1, args.interval))
@@ -3076,7 +3226,7 @@ CLI_ONLY = [
     {"name": "migrate", "summary": "迁移已有仓库", "audience": "human"},
     {"name": "upgrade", "summary": "旧项目升级检查（只读）", "audience": "human"},
     {"name": "hook install", "summary": "安装 pre-push 校验", "audience": "human"},
-    {"name": "watch", "summary": "bus 监听，新消息唤醒 agent（supervisor）", "audience": "supervisor"},
+    {"name": "watch", "summary": "bus 监听；--ensure 首个 agent 后台起，--status 查心跳", "audience": "any"},
     {"name": "msg watch", "summary": "单 agent 收件箱监听（--once exit 0/3）", "audience": "agent"},
     {"name": "mcp", "summary": "检测 / 安装 MCP 配置", "audience": "human"},
     {"name": "agent bootstrap", "summary": "名册为空时抢占第一个 Planner", "audience": "human"},
@@ -3143,6 +3293,7 @@ def cmd_onboard(args) -> int:
         encoding="utf-8", errors="replace")
     queue = load_queue(root)
     ident = (os.environ.get("AW_AGENT_ID") or "").strip()
+    watch = _watch_status_data(root)
 
     mode = "remote" if remote else "local"
     team = "team" if planners else "solo"
@@ -3157,6 +3308,8 @@ def cmd_onboard(args) -> int:
         questions.append("本终端用哪个 agent_id？（如 pcA-ba-1）")
     if not hook_ok:
         questions.append("是否安装 pre-push 校验？（aw.py hook install）")
+    if watch["status"] != "RUNNING":
+        questions.append("watcher 未运行：首个 agent 执行 aw.py watch --ensure，还是交给 supervisor？")
 
     data.update({
         "initialized": True,
@@ -3169,6 +3322,7 @@ def cmd_onboard(args) -> int:
         "roster": {"total": len(roster), "active": len(active),
                    "planner": planners[0]["id"] if planners else None},
         "hook": hook_ok,
+        "watch": watch,
         "queue": len(queue),
         "questions": questions,
         "next": [],
@@ -3177,6 +3331,8 @@ def cmd_onboard(args) -> int:
         data["next"].append("aw.py agent register <name> --role ba（solo 可直接 active）")
     if not hook_ok:
         data["next"].append("aw.py hook install")
+    if watch["status"] != "RUNNING":
+        data["next"].append("aw.py watch --ensure --interval 5 --wake-dir .aw/wake")
     data["next"].append("aw.py doctor")
 
     if args.json:
@@ -3190,6 +3346,7 @@ def cmd_onboard(args) -> int:
         print("  identity: %s" % (ident or "MISSING"))
         print("  roster : %d active / %d total" % (len(active), len(roster)))
         print("  hook   : %s" % ("OK" if hook_ok else "MISSING"))
+        print("  watch  : %s" % watch["status"])
         print("  queue  : %d" % len(queue))
         if questions:
             print("\n需要问用户：")
@@ -3757,6 +3914,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--json", action="store_true", help="每行一个 JSON")
     p_watch.add_argument("--exec", default="", help="收到消息时执行的命令（env: AW_WAKE_AGENT / AW_WAKE_MSG_ID）")
     p_watch.add_argument("--no-fetch", action="store_true")
+    p_watch.add_argument("--wake-dir", default="", help="把唤醒事件写到 <dir>/<agent>.json")
+    p_watch.add_argument("--status", action="store_true", help="查看 watcher 状态（pid / 心跳 / wake_dir）")
+    p_watch.add_argument("--ensure", action="store_true", help="没有 watcher 就在后台起一个（幂等）")
+    p_watch.add_argument("--stop", action="store_true", help="停止本机 watcher")
     p_watch.set_defaults(func=cmd_watch)
 
     p_stats = sub.add_parser("stats", help="运营指标（JSON / 表格）")
