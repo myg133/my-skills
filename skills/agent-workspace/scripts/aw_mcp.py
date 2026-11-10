@@ -35,6 +35,31 @@ NOTIFY = ("--no-notify" not in sys.argv
           and _NOTIFY_FLAG not in ("0", "false", "off", "no"))
 WRITE_LOCK = threading.Lock()
 READY = threading.Event()
+_AGENT_LOCK = threading.Lock()
+_NOTIFY_STARTED = threading.Event()
+
+
+def _bind_agent(identity: str) -> None:
+    """一个进程 = 一个身份。
+
+    优先 env AW_AGENT_ID / --agent；都没有时取首次 tools/call 的 agent_id。
+    这样多个 BA 共用一个 .mcp.json 也能各用各的身份（每个会话各起一个 aw_mcp 进程）。
+    """
+    global AGENT
+    if not identity:
+        return
+    with _AGENT_LOCK:
+        if not AGENT:
+            AGENT = identity
+            log("notify: 身份绑定 %s" % identity)
+        elif AGENT != identity:
+            log("notify: 本进程已绑定 %s，忽略 %s" % (AGENT, identity))
+            return
+        start = NOTIFY and not _NOTIFY_STARTED.is_set()
+        if start:
+            _NOTIFY_STARTED.set()
+    if start:
+        threading.Thread(target=notify_loop, daemon=True).start()
 
 
 def log(*args) -> None:
@@ -371,7 +396,7 @@ def notify_loop() -> None:
     if not NOTIFY:
         return
     if not AGENT:
-        log("notify: 没有 AW_AGENT_ID，通知已禁用")
+        log("notify: 没有身份（env AW_AGENT_ID / --agent / 首次调用 agent_id 均未提供），通知已禁用")
         return
     path = _wake_path(AGENT)
     seen: set[str] = _wake_ids(path) if path and path.exists() else set()
@@ -417,6 +442,7 @@ def call_tool(name: str, args: dict) -> dict:
                          "  2) 启动环境设置 AW_AGENT_ID=pcA-ba-1"}],
             "isError": True,
         }
+    _bind_agent(identity)
     entry = _roster_entry(identity) or {}
     auth_token = (str(args.get("token") or "").strip()
                   or (os.environ.get("AW_AGENT_TOKEN") or "").strip())
@@ -519,8 +545,11 @@ def main() -> int:
             pass
     log("aw-mcp %s starting; agent=%s pid=%d notify=%s"
         % (VERSION, AGENT or "(missing)", os.getpid(), NOTIFY))
-    if NOTIFY:
+    if NOTIFY and AGENT:
+        _NOTIFY_STARTED.set()
         threading.Thread(target=notify_loop, daemon=True).start()
+    elif NOTIFY:
+        log("notify: 未绑定身份，等首次 tools/call 的 agent_id 后再启动")
     for line in sys.stdin:
         line = line.strip()
         if not line:
