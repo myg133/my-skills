@@ -12,11 +12,14 @@ agent 客户端 ──stdio──► aw_mcp.py（每个 agent 一个进程）
                            aw.py
 ```
 
-- **一个 agent 一个终端 / 一个进程**：`AW_AGENT_ID` 由启动环境注入；
-- 服务器进程启动时：
-  - `AW_AGENT_PID = 本进程 pid`（liveness 用这个）
-  - `AW_SESSION_ID = proc-<pid>`（一个进程 = 一个会话）
-- 因此**不需要 `--agent` 参数，也不依赖 session_id 关联**。
+- **一个 agent 一个终端 / 一个进程**；
+- 身份优先级：`--agent` > `AW_AGENT_ID` > 首次 `tools/call` 的 `agent_id`；
+- 会话优先级：`--session` > `AW_SESSION_ID` > `PI_SESSION_ID` > `DSH_SESSION_ID`
+  > `CLAUDE_SESSION_ID` > `proc-<pid>`；
+  - 实际使用的来源写入 `.aw/sessions/<agent>.json` 的 `session_source`
+    （`session-arg` / `env:PI_SESSION_ID` / `generated` …）；
+  - `proc-<pid>` 只是兜底，审计上能区分“真会话”和“临时兜底”；
+- 服务器进程启动时设置 `AW_AGENT_PID = 本进程 pid`（liveness 用这个）。
 
 ## 1.1 安装（自动写配置）
 
@@ -351,9 +354,9 @@ aw verify
 
 | 客户端 | 配置文件 | 父键 | 工具名 | 环境变量 |
 |--------|----------|------|--------|----------|
-| omp | `.omp/mcp.json` 或 `~/.omp/agent/mcp.json` | `mcpServers` | 原名 | 大概率继承终端 |
-| mcode | 项目根 `.mcp.json` 或 `~/.minimax/mcp.json` | `mcpServers` | 原名 | 源码里是显式构造 |
-| DSH | `~/.dsh/profiles/<profile>/cordis.patch.yml` | YAML 列表 | `mcp__<server>__<tool>` | 必须显式转发 |
+| omp | `.omp/mcp.json` 或 `~/.omp/agent/mcp.json` | `mcpServers` | 原名 | 大概率继承终端；`${PI_SESSION_ID:-}` 可显式传 session |
+| mcode | 项目根 `.mcp.json` 或 `~/.minimax/mcp.json` | `mcpServers` | 原名 | 源码里是显式构造；首次调用绑定身份 |
+| DSH | `~/.dsh/profiles/<profile>/cordis.patch.yml` | YAML 列表 | `mcp__<server>__<tool>` | 必须显式转发 `AW_AGENT_ID` / `AW_SESSION_ID` |
 
 ### omp
 
@@ -366,6 +369,7 @@ aw verify
       "command": "python",
       "args": ["/path/to/aw_mcp.py"],
       "cwd": "/path/to/repo",
+      "env": { "AW_SESSION_ID": "${PI_SESSION_ID:-}" },
       "enabled": true,
       "timeout": 180000
     }
@@ -420,6 +424,7 @@ aw verify
         cwd: /path/to/repo
         env:
           AW_AGENT_ID: !!js process.env.AW_AGENT_ID
+          AW_SESSION_ID: !!js process.env.PI_SESSION_ID
         toolCallTimeoutMs: 180000
         failOnStartupError: false
 ```

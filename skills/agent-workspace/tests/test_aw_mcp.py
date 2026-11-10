@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -25,11 +26,31 @@ def send(proc, obj):
     proc.stdin.flush()
 
 
+def _lines(proc) -> "queue.Queue[str]":
+    """每个进程只起一个读线程，避免超时后残留的 reader 抢走下一行。"""
+    box = getattr(proc, "_lines", None)
+    if box is None:
+        box = queue.Queue()
+        setattr(proc, "_lines", box)
+
+        def reader():
+            try:
+                for line in proc.stdout:
+                    box.put(line)
+            except Exception:
+                pass
+            box.put("")
+
+        threading.Thread(target=reader, daemon=True).start()
+    return box
+
+
 def read_line(proc, timeout):
-    ready, _, _ = select.select([proc.stdout], [], [], timeout)
-    if not ready:
+    try:
+        line = _lines(proc).get(timeout=timeout)
+    except queue.Empty:
         return None
-    return proc.stdout.readline().strip() or None
+    return line.strip() or None
 
 
 def spawn(wake_dir, agent=None):
@@ -40,7 +61,8 @@ def spawn(wake_dir, agent=None):
     proc = subprocess.Popen(
         [sys.executable, str(MCP)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, cwd=str(wake_dir), env=env,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        cwd=str(wake_dir), env=env,
     )
     send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2024-11-05", "capabilities": {},
