@@ -62,6 +62,37 @@ aw.py mcp print                   # 打印通用 JSON（手工粘贴）
 - 每个 agent 用同一份配置，只改 `AW_AGENT_ID`；
 - 没有 `AW_AGENT_ID` 时服务照常启动，但每次工具调用返回 `MISSING_AGENT_ID`。
 
+### 主动通知（notifications/message，默认开启）
+
+MCP 进程默认启动一个后台线程，tail
+`.aw/wake/<agent>.json`（或 `AW_WAKE_DIR` 指定目录），有新消息时发：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/message",
+  "params": {
+    "level": "info",
+    "logger": "aw",
+    "data": {
+      "agent": "pcA-ba-1", "id": "a1b2c3d4", "from": "pcA-ba-2",
+      "type": "question", "subject": "…", "expect": "reply",
+      "at": "2026-11-10T08:00:00Z"
+    }
+  }
+}
+```
+
+- 默认开启；关闭：环境变量 `AW_MCP_NOTIFY=0` 或启动参数 `--no-notify`；
+- 只在 MCP 完成 `initialize` 之后发；
+- 启动时对文件里已有消息做 seed，不重放；
+- 同一条 `id` 只通知一次；
+- 通知只带 id/type/from/expect，不带正文和路径；
+- 需要同仓库有 `aw.py watch --ensure` 在写 wake 文件。
+
+**宿主支持差异**：很多客户端只把 `notifications/message` 当日志，不会自动起一轮。
+不支持时仍用 `msg_inbox` / `msg_wait`，通知只是提示。
+
 ## 2.1 没有环境变量时：每次调用带 agent_id
 
 桌面端 agent 往往拿不到 `AW_AGENT_ID`。这种情况下，**每个工具都接受一个可选的 `agent_id` 参数**：
