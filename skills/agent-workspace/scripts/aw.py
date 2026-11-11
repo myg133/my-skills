@@ -928,11 +928,17 @@ def _session_alive(rec: dict, ttl: int = SESSION_TTL_SECONDS) -> bool:
 
 
 SESSION_ENV = (
-    ("AW_SESSION_ID", "env:AW_SESSION_ID"),
-    ("PI_SESSION_ID", "env:PI_SESSION_ID"),
-    ("DSH_SESSION_ID", "env:DSH_SESSION_ID"),
-    ("CLAUDE_SESSION_ID", "env:CLAUDE_SESSION_ID"),
+    ("AW_SESSION_ID", "AW_SESSION_ID"),
+    ("PI_SESSION_ID", "PI_SESSION_ID"),
+    ("DSH_SESSION_ID", "DSH_SESSION_ID"),
+    ("CLAUDE_SESSION_ID", "CLAUDE_SESSION_ID"),
 )
+
+SESSION_MAP_VERSION = 2
+SESSION_MAP_THROTTLE_SECONDS = 60
+SESSION_MAP_TTL_SECONDS = 120 * 60
+SESSION_MAP_MAX_SESSIONS = 8
+SESSION_GENERATED_SOURCES = ("generated", "mcp")
 
 
 def _resolve_session() -> tuple[str, str]:
@@ -945,6 +951,143 @@ def _resolve_session() -> tuple[str, str]:
                 return value, forced
             return value, label
     return "proc-%d" % os.getpid(), "generated"
+
+
+def _map_source(source: str) -> str:
+    value = (source or "").strip()
+    return value[4:] if value.startswith("env:") else value
+
+
+BY_SESSION_MAX = 500
+BY_SESSION_TTL_DAYS = 7
+
+
+def _by_session_path(root: Path, session_id: str) -> Path:
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return aw_path(root, "sessions", "by-session", "%s.json" % key)
+
+
+def _gc_by_session(root: Path) -> None:
+    """best-effort GC：最多 500 条，超过 7 天删除；不加锁。"""
+    folder = aw_path(root, "sessions", "by-session")
+    if not folder.is_dir():
+        return
+    now = time.time()
+    files = []
+    for item in folder.glob("*.json"):
+        try:
+            st = item.stat()
+        except OSError:
+            continue
+        if now - st.st_mtime > BY_SESSION_TTL_DAYS * 86400:
+            try:
+                item.unlink()
+            except OSError:
+                pass
+            continue
+        files.append((st.st_mtime, item))
+    if len(files) <= BY_SESSION_MAX:
+        return
+    for _, item in sorted(files)[:len(files) - BY_SESSION_MAX]:
+        try:
+            item.unlink()
+        except OSError:
+            pass
+
+
+def _lookup_session_agent(root: Path, session_id: str) -> str:
+    data = read_json(_by_session_path(root, session_id), {})
+    return (data.get("agent_id") or "").strip()
+
+
+def _write_session_map(root: Path, agent_id: str, record: dict, source: str,
+                       quiet: bool = False) -> None:
+    """写权威映射 + 反向映射；失败只 warn。
+
+    - 只在真实会话来源下写；generated / mcp / AW_FROM_MCP=1 跳过；
+    - 同 session_id 60 秒内不重复写；
+    - sessions 保留最近 8 条；120 分钟内出现不同 id 时追加并 warn；
+    - 每 agent 一个文件，write_json 原子替换，无需共享锁。
+    """
+    if os.environ.get("AW_MAP_WRITE") != "1":
+        return
+    if os.environ.get("AW_FROM_MCP") == "1":
+        return
+    if (source or "").strip() in SESSION_GENERATED_SOURCES:
+        return
+    session_id = (record.get("session_id") or "").strip()
+    if not session_id:
+        return
+    path = aw_path(root, "sessions", "%s.map.json" % agent_id)
+    by_path = _by_session_path(root, session_id)
+    old = read_json(path, {})
+    same = old.get("session_id") == session_id and old.get("map_version") == SESSION_MAP_VERSION
+    if same and by_path.exists():
+        age = _age_seconds(old.get("updated_at"))
+        if age is not None and age < SESSION_MAP_THROTTLE_SECONDS:
+            return
+
+    now = _now()
+    entries = []
+    raw = old.get("sessions")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("session_id"):
+                entries.append({
+                    "session_id": str(item["session_id"]),
+                    "source": str(item.get("source") or ""),
+                    "at": str(item.get("at") or ""),
+                })
+    if not entries and old.get("session_id"):
+        entries.append({
+            "session_id": str(old["session_id"]),
+            "source": str(old.get("session_source") or ""),
+            "at": str(old.get("updated_at") or now),
+        })
+
+    recent = [e for e in entries
+              if e["session_id"] != session_id
+              and (_age_seconds(e.get("at")) or 0) < SESSION_MAP_TTL_SECONDS]
+    if recent and not quiet:
+        print("warn: agent %s 在 120 分钟内有多个会话（%s）；消费方需按 session 区分"
+              % (agent_id, ", ".join(e["session_id"] for e in recent)), file=sys.stderr)
+
+    entries = [e for e in entries if e["session_id"] != session_id]
+    entries.append({"session_id": session_id,
+                    "source": _map_source(source), "at": now})
+    entries = entries[-SESSION_MAP_MAX_SESSIONS:]
+
+    data = {
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "session_source": _map_source(source),
+        "session_authoritative": True,
+        "sessions": entries,
+        "host": socket.gethostname(),
+        "cwd": str(Path.cwd()),
+        "pid": 0,
+        "updated_at": now,
+        "map_version": SESSION_MAP_VERSION,
+    }
+    failed = False
+    try:
+        write_json(path, data)
+    except OSError as exc:
+        failed = True
+        if not quiet:
+            print("warn: 写会话映射失败（不影响命令）: %s" % exc, file=sys.stderr)
+    if not session_id.startswith("proc-"):
+        try:
+            write_json(by_path, {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "source": _map_source(source),
+                "updated_at": now,
+            })
+            _gc_by_session(root)
+        except OSError as exc:
+            if not failed and not quiet:
+                print("warn: 写反向会话映射失败（不影响命令）: %s" % exc, file=sys.stderr)
 
 
 def _claim_session_state(rec: dict, claim: dict, ttl: int = SESSION_TTL_SECONDS) -> str:
@@ -1124,6 +1267,20 @@ def resolve_identity(root: Path, role: str = "ba", rebind: bool = False) -> dict
     aw_init(root)
     path = aw_path(root, "sessions", "%s.json" % agent_id)
     old = read_json(path, {})
+    generated = session_source in SESSION_GENERATED_SOURCES
+    mcp_session_id = session_id if generated else ""
+    if generated:
+        old_session = (old.get("session_id") or "").strip()
+        if old_session:
+            session_id = old_session
+            session_source = old.get("session_source") or session_source
+            authoritative = bool(old.get(
+                "session_authoritative",
+                session_source not in SESSION_GENERATED_SOURCES))
+        else:
+            authoritative = False
+    else:
+        authoritative = True
     agent_pid = int(os.environ.get("AW_AGENT_PID") or 0)
     if not agent_pid and old.get("pid") and pid_alive(int(old["pid"])):
         agent_pid = int(old["pid"])
@@ -1141,6 +1298,7 @@ def resolve_identity(root: Path, role: str = "ba", rebind: bool = False) -> dict
         "agent_id": agent_id,
         "session_id": session_id,
         "session_source": session_source,
+        "session_authoritative": authoritative,
         "pid": agent_pid,
         "host": socket.gethostname(),
         "role": role,
@@ -1149,7 +1307,18 @@ def resolve_identity(root: Path, role: str = "ba", rebind: bool = False) -> dict
         "last_seen": _now(),
         "source": source,
     }
-    write_json(path, record)
+    if mcp_session_id:
+        record["mcp_session_id"] = mcp_session_id
+    resolved_by = (os.environ.get("AW_AGENT_RESOLVED_BY") or "").strip()
+    if resolved_by:
+        record["resolved_by"] = resolved_by
+    session_written = True
+    try:
+        write_json(path, record)
+    except OSError as exc:
+        session_written = False
+        print("warn: 写会话记录失败（不影响命令）: %s" % exc, file=sys.stderr)
+    _write_session_map(root, agent_id, record, session_source, quiet=not session_written)
     return record
 
 
@@ -1729,6 +1898,10 @@ def cmd_agent(args) -> int:
                 return 3
             print("BOUND %s" % name)
             print("  anchor: %s" % anchor)
+            try:
+                resolve_identity(root)
+            except (GitError, IdentityError) as exc:
+                print("warn: 绑定后刷新会话失败: %s" % exc, file=sys.stderr)
             return 0
         bindings = load_bindings(root)
         bindings.pop(key, None)
@@ -1736,8 +1909,30 @@ def cmd_agent(args) -> int:
         print("UNBOUND %s" % anchor)
         return 0
 
+    if action == "whoami" and not getattr(args, "agent", None):
+        session = (getattr(args, "session", None) or os.environ.get("AW_SESSION_ID") or "").strip()
+        if session:
+            mapped = _lookup_session_agent(root, session)
+            if mapped:
+                os.environ["AW_AGENT_ID"] = mapped
+                os.environ["AW_AGENT_SOURCE"] = "session-map"
+                os.environ["AW_AGENT_RESOLVED_BY"] = "session-map"
+
     ident = resolve_identity(root)
     reg = next((a for a in load_roster(root) if a["id"] == ident["agent_id"]), None)
+    if getattr(args, "json", False) and action == "whoami":
+        print(json.dumps({
+            "agent_id": ident["agent_id"],
+            "session_id": ident["session_id"],
+            "role": ident["role"],
+            "repo": str(root),
+            "holding": (holding_claim(load_claims(root), ident["agent_id"]) or {}).get("req", ""),
+            "source": ident.get("source", "unknown"),
+            "anchor": anchor or "",
+            "roster": reg.get("status", "active") if reg else "unregistered",
+            "resolved_by": ident.get("resolved_by") or "identity",
+        }, ensure_ascii=False, indent=2))
+        return 0
     print("agent_id : %s" % ident["agent_id"])
     print("session  : %s" % ident["session_id"])
     print("role     : %s" % ident["role"])
@@ -4103,13 +4298,15 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("AW_AGENT_SOURCE", "env AW_AGENT_ID")
     if getattr(args, "session", None):
         os.environ["AW_SESSION_ID"] = args.session
-        os.environ["AW_SESSION_SOURCE"] = "session-arg"
+        os.environ["AW_SESSION_SOURCE"] = "--session"
     elif os.environ.get("AW_SESSION_ID"):
-        os.environ.setdefault("AW_SESSION_SOURCE", "env:AW_SESSION_ID")
+        os.environ.setdefault("AW_SESSION_SOURCE", "AW_SESSION_ID")
     if getattr(args, "no_bind", False):
         os.environ["AW_NO_BIND"] = "1"
     if getattr(args, "agent_token", None):
         os.environ["AW_AGENT_TOKEN"] = args.agent_token
+    if getattr(args.func, "__name__", "") in ("cmd_agent", "cmd_claim"):
+        os.environ["AW_MAP_WRITE"] = "1"
     try:
         return args.func(args)
     except IdentityError as exc:
