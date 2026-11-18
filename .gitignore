@@ -17,4 +17,5 @@ skills/superset-skill
 skills/x-cli-meta-skill
 
 skills/lark-*
-
+skills/orchestration
+skills/orca-*
