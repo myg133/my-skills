@@ -64,6 +64,18 @@
 - 不要轮询、不要等待子 Agent 完成后再开一轮"看看"；
 - 子 Agent 的结果由父会话在下一轮统一消费。
 
+### 3.4 换班用 handoff / resume
+
+常驻 BA / Planner 换班时不要新建 agent_id，也不要直接删 session：
+
+~~~text
+旧会话: agent handoff -> 停进程
+新会话: 同一 AW_AGENT_ID -> agent whoami -> agent resume
+~~~
+
+handoff 会记录未读/待回复消息、claim、下一步，保留 claim，不推进已读。
+完整协议与状态边界见 [handoff.md](handoff.md)。
+
 ## 4. 会话任务卡
 
 每次开新会话（或 spawn 子 Agent）先填这张卡：
@@ -134,7 +146,8 @@ REQ / 任务：
 - 长报告写文件 / 链接，不在对话里贴全文；
 - 同一个文件不要反复全量读；需要时读 diff 或指定行；
 - 到 8 万上下文先压缩 / 交接，不要等到 30 万；
-- 一个会话只围绕一个主题，避免多任务交叉污染。
+- 一个会话只围绕一个主题，避免多任务交叉污染；
+- 探索分工与 evidence 交接见 [exploration.md](exploration.md)，不要 BA 和子 Agent 重复探索。
 
 ## 8. 什么时候停
 
