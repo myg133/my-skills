@@ -75,6 +75,13 @@ class WorkspaceCase(unittest.TestCase):
         self.assertIn("branch refs/heads/deploy", wt)
         self.assertTrue((self.repo / "BA" / "dispatch" / "agent-registry.md").exists())
 
+    def test_subagent_blocks_messages_watch_claim(self):
+        for args in (["msg", "watch", "--once"], ["watch", "--once"],
+                     ["claim", "next"], ["agent", "whoami"]):
+            out = run(args, self.repo, extra_env={"AW_SUBAGENT": "1"})
+            self.assertNotEqual(out.returncode, 0, args)
+            self.assertIn("SUBAGENT_NO_", out.stderr, args)
+
     def test_repo_option_selects_other_workspace(self):
         other = self.tmp / "other"
         run(["init", str(other), "--name", "Other"], self.tmp)
@@ -176,6 +183,7 @@ class WorkspaceCase(unittest.TestCase):
             names = {t["name"] for t in tools["result"]["tools"]}
             self.assertIn("claim_next", names)
             self.assertIn("msg_send", names)
+            self.assertIn("msg_report", names)
             self.assertIn("msg_wait", names)
             self.assertIn("msg_list", names)
             self.assertIn("doctor", names)
@@ -268,6 +276,19 @@ class WorkspaceCase(unittest.TestCase):
         self.assertEqual(act.returncode, 0, act.stderr)
         ok = run(["msg", "send", "--to", "all", "--body", "x"], self.repo, agent="ba-1")
         self.assertEqual(ok.returncode, 0, ok.stderr)
+
+    def test_msg_report_prefers_active_planner(self):
+        boot = run(["agent", "bootstrap", "planner-1"], self.repo / "BA", agent=None)
+        token = re.search(r"TOKEN planner-1 ([0-9a-f]+)", boot.stdout).group(1)
+        run(["agent", "register", "ba-1", "--role", "ba"], self.repo / "BA", agent=None)
+        act = run(["agent", "activate", "ba-1", "--agent-token", token],
+                  self.repo / "BA", agent=None)
+        self.assertEqual(act.returncode, 0, act.stderr)
+        out = run(["msg", "report", "--subject", "new task",
+                   "--body", "REQ-001"], self.repo, agent="ba-1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        planner_inbox = list((self.repo / ".aw" / "inbox" / "planner-1").glob("*.json"))
+        self.assertEqual(len(planner_inbox), 1)
 
     def test_agent_register_issues_token(self):
         out = run(["agent", "register", "ba-1", "--issue-token"], self.repo / "BA", agent=None)

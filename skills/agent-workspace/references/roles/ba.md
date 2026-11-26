@@ -189,6 +189,7 @@ msg_reply {"id": "<id>", "body": "..."}
 Evidence：按 assets/templates/exploration-evidence.md.tpl 附已确认/待验证/不要重读
 BA 预检：切片目标 / 预期文件 / 预期 diff / AC 子集 / 预算
 子 Agent：最多 2 个；没有 diff 预期的任务不 spawn；超过切片预算就拆
+子 Agent 环境：AW_SUBAGENT=1 / AW_NO_MSG=1 / AW_ROLE=dev|qa|explore；结果回父会话，不走 bus
 换班：agent handoff 记录未处理消息；新会话同一 AW_AGENT_ID，agent resume
 约束：只改本 worktree；不 merge；不引入新依赖；完成后回报，不改 status.md
 ```
@@ -245,7 +246,9 @@ git push origin --delete feature/REQ-003
 
 - **不自己实现/测试/部署**：实现派 Dev、验证派 QA、发布派 Deploy；你只写需求、验收、状态。
 - 状态只由你改；Dev/QA 只报告。
+- 用户直接指派任务后，先 `msg report`：有 active Planner 发 Planner，否则广播；再 claim / 实现。
 - 不给同一个 worktree 派第二个需求。
 - 子 Agent 的 briefing 必须自包含，且带绝对路径。
+- 导出/截图/日志写 `<repo-root>/.aw/exports/<REQ>/`；临时文件写 `.aw/tmp/`；禁止写盘根、`%TEMP%`、Desktop、Downloads。
 - `push` / `merge` / `--delete` 属于外部可见动作，用户未预授权时先确认。
 - 需求编号不复用；取消的需求保留占位行。

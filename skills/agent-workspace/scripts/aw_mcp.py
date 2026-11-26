@@ -42,8 +42,10 @@ AGENT = (_arg_value("--agent") or os.environ.get("AW_AGENT_ID") or "").strip()
 VERSION = "1.6.0"
 PROTOCOL = "2024-11-05"
 _NOTIFY_FLAG = (os.environ.get("AW_MCP_NOTIFY") or "").strip().lower()
-# 默认开启；AW_MCP_NOTIFY=0 / --no-notify 关闭
+_SUBAGENT = (os.environ.get("AW_SUBAGENT") or os.environ.get("AW_NO_MSG") or "").strip().lower() in ("1", "true", "yes", "on")
+# 默认开启；AW_MCP_NOTIFY=0 / --no-notify / 子 Agent 关闭
 NOTIFY = ("--no-notify" not in sys.argv
+          and not _SUBAGENT
           and _NOTIFY_FLAG not in ("0", "false", "off", "no"))
 WRITE_LOCK = threading.Lock()
 READY = threading.Event()
@@ -186,6 +188,11 @@ TOOLS = [
           "reply_by": STR,
           "force": {**BOOL, "description": "跳过收件人注册校验"}},
          ["to", "body"]),
+    tool("msg_report", "BA 接用户任务后报备：有 active Planner 就发 Planner，否则广播",
+         {"body": STR, "subject": STR,
+          "type": {**STR, "enum": ["fyi", "question", "blocker", "handoff",
+                                    "contract-change", "contract-ack", "decision"]},
+          "ref": STR}, ["body"]),
     tool("msg_inbox", "读取发给我的未读消息", {"all": BOOL, "limit": INT, "full": BOOL,
                                               "no_advance": BOOL, "json": BOOL}),
     tool("msg_wait", "阻塞等待发给我的新消息（默认 120 秒，不消费）",
@@ -302,6 +309,15 @@ def build_argv(name: str, args: dict) -> list[str]:
             argv += ["--expect", a["expect"]]
         if a.get("force"):
             argv.append("--force")
+        return argv
+    if name == "msg_report":
+        argv = ["msg", "report", "--body", a["body"]]
+        if a.get("subject"):
+            argv += ["--subject", a["subject"]]
+        if a.get("type"):
+            argv += ["--type", a["type"]]
+        if a.get("ref"):
+            argv += ["--ref", a["ref"]]
         return argv
     if name == "msg_inbox":
         argv = ["msg", "inbox"]
@@ -461,6 +477,9 @@ def notify_loop() -> None:
         log("notify: 没有身份（env AW_AGENT_ID / --agent / 首次调用 agent_id 均未提供），通知已禁用")
         return
     path = _wake_path(AGENT)
+    repo_text = ""
+    if path and path.parent.name == "wake" and path.parent.parent.name == ".aw":
+        repo_text = str(path.parent.parent.parent)
     seen: set[str] = set(_NOTIFY_SEEN)
     if not READY.wait(timeout=30):
         log("notify: 等待 initialize 超时，通知未启动")
@@ -481,6 +500,7 @@ def notify_loop() -> None:
                 seen.add(mid)
                 notify_message({
                     "agent": msg.get("agent") or AGENT,
+                    "repo": repo_text,
                     "id": mid,
                     "from": msg.get("from", ""),
                     "type": msg.get("type", ""),
